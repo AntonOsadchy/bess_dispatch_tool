@@ -1,0 +1,18 @@
+.git
+.gitignore
+.dockerignore
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+.env
+.venv
+venv
+.docker
+.DS_Store
+# Generated outputs (host copies via bind mount are used at runtime)
+dispatch_results.csv
+out.csv
+# Reference / legacy tree; not needed in the app image
+Untitled

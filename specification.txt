@@ -1,0 +1,22 @@
+# BESS dispatch — key = value (lines starting with # ignored)
+
+prices_csv = inputs/prices.csv
+output_csv = outputs/dispatch_results.csv
+# One price row = one hour (interval length is fixed in src/bess_dispatch_opt.py).
+
+# Rated AC power MW; max grid MWh per row = power * interval_hours (interval_hours is 1.0 in code).
+power = 0.25
+
+# Usable energy capacity MWh
+capacity_mwh = 2
+
+# Round-trip efficiency (0–1]: symmetric one-way efficiency is √(this). Stored MWh gained = grid_import_mwh × √η_rt; per grid MWh exported, stored drops by 1/√η_rt (so grid-to-grid round-trip = η_rt).
+round_trip_efficiency = 0.9
+
+# Extra cost per MWh charged / discharged (same units as prices); omit or set 0 to disable
+charge_tariff = 10
+discharge_tariff = 0
+
+# Optional: max equivalent cycles: √(round_trip_efficiency) × sum(grid charge MWh) / capacity_mwh (stored charge / capacity). Entire line
+# must be active (no leading # on max_cycles) or the cap is not applied.
+#max_cycles = 365

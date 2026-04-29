@@ -1,0 +1,4 @@
+# Docker uses Python 3.12; local installs may use older Pythons — keep ranges loose.
+pandas>=2.0.0
+pyomo>=6.7.0
+highspy>=1.7.0

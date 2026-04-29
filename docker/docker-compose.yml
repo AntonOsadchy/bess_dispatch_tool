@@ -1,0 +1,16 @@
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: bess-analyser:local
+    working_dir: /app
+    init: true
+    volumes:
+      # Mount project root so spec/prices/output stay on the host
+      - ..:/app
+    environment:
+      PYTHONPATH: /app
+      BESS_SPEC: /app/specification.txt
+    stdin_open: true
+    tty: true
