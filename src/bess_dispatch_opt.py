@@ -8,6 +8,36 @@ CSV: grid_import_mwh / grid_export_mwh at the meter; charge_mwh / discharge_mwh 
 (stored gain = grid_import × η_leg; stored loss to deliver export = grid_export / η_leg), so Δsoc_mwh ≈ charge_mwh − discharge_mwh.
 Each price CSV row is treated as one hour (see INTERVAL_HOURS).
 Optional max equivalent cycles; charge/discharge tariffs apply to grid MWh (same units as prices).
+
+Co-location mode (optional):
+When generation_profile_csv and generation_max_mw are provided in the spec, the model treats the
+BESS as co-located with a generator.  The profile CSV contains per-timestep capacity factors [0–1];
+multiplied by generation_max_mw they give available generation MWh per interval.
+
+Two additional constraints are added in co-location mode:
+
+  1. Discharge headroom (BESS export limited to remaining grid connection after generation):
+         dsch_mwh[t] ≤ connection_mwh - generation_mwh[t]
+     where connection_mwh = grid_connection_mw × interval_hours (falls back to power_mw if
+     grid_connection_mw is not set).  Generation already occupies part of the grid connection,
+     so the BESS can only use what is left.
+
+  2. Round-trip tariff relief for BTM-charged energy:
+     Energy charged behind the meter (from generation, up to gen_avail[t]) avoids both the
+     charge_tariff on import and the discharge_tariff on its eventual export — it never crossed
+     the import meter and its discharge is treated as unmetered.
+     Auxiliary variable ch_grid_mwh[t] = max(0, ch_mwh[t] − generation_mwh[t]) tracks the
+     taxable (above-generation) share of charging. It is pinned by:
+         ch_grid_mwh[t] ≥ ch_mwh[t] − generation_mwh[t]
+         ch_grid_mwh[t] ≤ ch_mwh[t]
+         ch_grid_mwh[t] ≥ 0
+     Objective tariff terms in co-location mode:
+         − (charge_tariff + discharge_tariff) × ch_grid_mwh[t]
+         − discharge_tariff × (dsch_mwh[t] − ch_mwh[t])
+     Verification: fully BTM cycle (ch_grid=0): total tariff = 0 ✓
+                   fully grid cycle (ch_grid=ch_mwh): total tariff = charge_tariff + discharge_tariff ✓
+
+Grid import for charging (ch_mwh) is still unrestricted by the generation profile.
 """
 
 from __future__ import annotations
@@ -69,6 +99,22 @@ def load_prices_csv(path: Path) -> list[float]:
     return s.astype(float).tolist()
 
 
+def load_profile_csv(path: Path, max_mw: float) -> list[float]:
+    """Load a single-column, headerless capacity-factor profile and scale by max_mw.
+
+    The file must contain one numeric value per row representing a capacity factor [0–1]
+    (same layout as the prices CSV, e.g. solar_profile_Denmark_1h_2024.csv).
+    Values are clipped to [0, 1] before scaling.
+    Returns MWh per interval (= capacity_factor × max_mw × INTERVAL_HOURS).
+    """
+    df = pd.read_csv(path, header=None)
+    s = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
+    if s.empty:
+        sys.exit(f"No numeric values found in profile CSV: {path}")
+    cf = s.clip(0.0, 1.0).astype(float)
+    return (cf * max_mw * INTERVAL_HOURS).tolist()
+
+
 def build_and_solve(
     prices: list[float],
     *,
@@ -78,6 +124,8 @@ def build_and_solve(
     charge_tariff: float,
     discharge_tariff: float,
     max_cycles: float | None,
+    generation_mwh: list[float] | None = None,
+    grid_connection_mw: float | None = None,
 ) -> tuple[pyo.ConcreteModel, pyo.SolverResults]:
     rte = round_trip_efficiency
     if not (0 < rte <= 1):
@@ -86,10 +134,20 @@ def build_and_solve(
     if T == 0:
         sys.exit("Empty price series")
 
+    if generation_mwh is not None:
+        if len(generation_mwh) != T:
+            sys.exit(
+                f"Generation profile length ({len(generation_mwh)}) does not match "
+                f"price series length ({T}). Align the two CSVs to the same period."
+            )
+
     eta_leg = math.sqrt(rte)
     cap = capacity_mwh
     dt = INTERVAL_HOURS
+    # Upper bound on grid-side MWh per timestep: tightest of BESS power and grid connection.
     max_mwh = power_mw * dt
+    if grid_connection_mw is not None:
+        max_mwh = min(max_mwh, grid_connection_mw * dt)
     times = list(range(T))
 
     m = pyo.ConcreteModel()
@@ -120,7 +178,61 @@ def build_and_solve(
 
         m.cycle_cap = pyo.Constraint(rule=cycle_cap_rule)
 
+    # Co-location constraints.
+    if generation_mwh is not None:
+        # If grid_connection_mw is not set, power_mw is used as the connection reference.
+        connection_dt = (grid_connection_mw if grid_connection_mw is not None else power_mw) * dt
+
+        # Cap generation at connection capacity so discharge headroom never goes negative.
+        gen_param = {t: min(generation_mwh[t], connection_dt) for t in times}
+        m.gen_avail = pyo.Param(m.T, initialize=gen_param)
+
+        # Discharge headroom: generation already occupies part of the grid connection.
+        # BESS can only export the remaining capacity:
+        #   dsch_mwh[t] <= connection_dt - gen_avail[t]
+
+        def colocation_rule(mm, t):
+            return mm.dsch_mwh[t] <= connection_dt - mm.gen_avail[t]
+
+        m.colocation_cons = pyo.Constraint(m.T, rule=colocation_rule)
+
+        # Behind-the-meter tariff split for charging.
+        # ch_grid_mwh[t] = max(0, ch_mwh[t] - gen_avail[t])  — the taxable grid-import share.
+        # Linearised with both a lower and upper bound:
+        #   ch_grid_mwh[t] >= ch_mwh[t] - gen_avail[t]   (pushes value up when ch > gen)
+        #   ch_grid_mwh[t] <= ch_mwh[t]                   (caps at total charging; fixes
+        #                                                   reporting when charge_tariff = 0)
+        #   ch_grid_mwh[t] >= 0                            (from variable bound)
+        m.ch_grid_mwh = pyo.Var(m.T, bounds=(0.0, max_mwh))
+
+        def ch_grid_lb_rule(mm, t):
+            return mm.ch_grid_mwh[t] >= mm.ch_mwh[t] - mm.gen_avail[t]
+
+        m.ch_grid_lb = pyo.Constraint(m.T, rule=ch_grid_lb_rule)
+
+        def ch_grid_ub_rule(mm, t):
+            return mm.ch_grid_mwh[t] <= mm.ch_mwh[t]
+
+        m.ch_grid_ub = pyo.Constraint(m.T, rule=ch_grid_ub_rule)
+
     def profit_rule(mm):
+        if generation_mwh is not None:
+            # Round-trip tariff relief for BTM-charged energy:
+            # ch_btm[t] = ch_mwh[t] - ch_grid_mwh[t]  (charged from generation, no meter crossing)
+            # That energy avoids charge_tariff on the way in AND discharge_tariff on the way out.
+            # Equivalently: apply both tariffs to ch_grid_mwh[t] (grid-charged share) and
+            # discharge_tariff only to (dsch_mwh[t] - ch_btm[t]) = dsch_mwh[t] - ch_mwh[t] + ch_grid_mwh[t].
+            # Expanding: charge_tariff*ch_grid + discharge_tariff*(dsch - ch_mwh + ch_grid)
+            #          = charge_tariff*ch_grid + discharge_tariff*dsch
+            #            - discharge_tariff*ch_mwh + discharge_tariff*ch_grid
+            #          = (charge_tariff + discharge_tariff)*ch_grid
+            #            + discharge_tariff*(dsch - ch_mwh)
+            return sum(
+                mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
+                - discharge_tariff * (mm.dsch_mwh[t] - mm.ch_mwh[t])
+                - (charge_tariff + discharge_tariff) * mm.ch_grid_mwh[t]
+                for t in times
+            )
         return sum(
             mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
             - discharge_tariff * mm.dsch_mwh[t]
@@ -146,6 +258,7 @@ def write_output(
     round_trip_efficiency: float,
     charge_tariff: float,
     discharge_tariff: float,
+    generation_mwh: list[float] | None = None,
 ) -> None:
     eta_leg = math.sqrt(round_trip_efficiency)
     rows = []
@@ -158,25 +271,42 @@ def write_output(
         soc_mwh_val = pyo.value(model.soc_mwh[t])
         soc_frac = soc_mwh_val / capacity_mwh
         p = prices[t]
-        revenue = (
-            p * (dsch_grid - ch_grid)
-            - discharge_tariff * dsch_grid
-            - charge_tariff * ch_grid
-        )
+
+        if generation_mwh is not None:
+            # Taxable share of charging: grid import above available generation.
+            ch_grid_taxable = pyo.value(model.ch_grid_mwh[t])
+            ch_btm = ch_grid - ch_grid_taxable          # behind-the-meter share (untaxed)
+            revenue = (
+                p * (dsch_grid - ch_grid)
+                - discharge_tariff * dsch_grid
+                - charge_tariff * ch_grid_taxable
+            )
+        else:
+            ch_grid_taxable = ch_grid
+            ch_btm = 0.0
+            revenue = (
+                p * (dsch_grid - ch_grid)
+                - discharge_tariff * dsch_grid
+                - charge_tariff * ch_grid
+            )
+
         cumulative_revenue += revenue
-        rows.append(
-            {
-                "price": p,
-                "soc": soc_frac,
-                "soc_mwh": soc_mwh_val,
-                "grid_import_mwh": ch_grid,
-                "grid_export_mwh": dsch_grid,
-                "charge_mwh": ch_stored,
-                "discharge_mwh": dsch_stored,
-                "revenue": revenue,
-                "cumulative_revenue": cumulative_revenue,
-            }
-        )
+        row: dict = {
+            "price": p,
+            "soc": soc_frac,
+            "soc_mwh": soc_mwh_val,
+            "grid_import_mwh": ch_grid,
+            "grid_export_mwh": dsch_grid,
+            "charge_mwh": ch_stored,
+            "discharge_mwh": dsch_stored,
+            "revenue": revenue,
+            "cumulative_revenue": cumulative_revenue,
+        }
+        if generation_mwh is not None:
+            row["generation_mw"] = generation_mwh[t] / INTERVAL_HOURS
+            row["charge_btm_mwh"] = ch_btm        # charged from generation (no tariff)
+            row["charge_grid_mwh"] = ch_grid_taxable  # charged from grid (tariff applied)
+        rows.append(row)
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(path, index=False)
 
@@ -232,14 +362,45 @@ def main() -> None:
     discharge_tariff = spec_float(spec, "discharge_tariff", default=0.0)
     max_cycles = spec_optional_float(spec, "max_cycles")
     capacity_mwh = spec_float(spec, "capacity_mwh")
+    grid_connection_mw = spec_optional_float(spec, "grid_connection_mw")
+
+    # Co-location: enabled by uncommenting generation_profile_csv in the spec.
+    # generation_max_mw must also be set when the profile is active.
+    gen_profile_csv = spec.get("generation_profile_csv", "").strip()
+    generation_mwh: list[float] | None = None
+    if gen_profile_csv:
+        gen_max_mw_raw = spec.get("generation_max_mw", "").strip()
+        if not gen_max_mw_raw:
+            sys.exit(
+                "generation_profile_csv is set but generation_max_mw is missing. "
+                "Add generation_max_mw to the spec."
+            )
+        gen_max_mw = float(gen_max_mw_raw)
+        if gen_max_mw <= 0:
+            sys.exit("generation_max_mw must be positive")
+        generation_mwh = load_profile_csv(Path(gen_profile_csv), gen_max_mw)
+        print(
+            f"Co-location mode: profile={gen_profile_csv}, generation_max_mw={gen_max_mw} MW",
+            flush=True,
+        )
 
     if power_mw <= 0:
         sys.exit("power must be positive")
     if capacity_mwh <= 0:
         sys.exit("capacity_mwh must be positive")
+    if grid_connection_mw is not None and grid_connection_mw <= 0:
+        sys.exit("grid_connection_mw must be positive")
     if max_cycles is not None and max_cycles < 0:
         sys.exit("max_cycles must be non-negative")
     prices = load_prices_csv(prices_path)
+
+    if grid_connection_mw is not None:
+        effective_max = min(power_mw, grid_connection_mw)
+        print(
+            f"Grid connection cap: {grid_connection_mw} MW "
+            f"(effective grid limit per interval: {effective_max} MW)",
+            flush=True,
+        )
 
     if max_cycles is not None:
         print(f"Cycle cap applied: max_cycles={max_cycles}", flush=True)
@@ -258,6 +419,8 @@ def main() -> None:
         charge_tariff=charge_tariff,
         discharge_tariff=discharge_tariff,
         max_cycles=max_cycles,
+        generation_mwh=generation_mwh,
+        grid_connection_mw=grid_connection_mw,
     )
 
     ok = (
@@ -278,8 +441,13 @@ def main() -> None:
         for t in range(Tn)
     )
     tariff_component = sum(
-        charge_tariff * pyo.value(model.ch_mwh[t])
-        + discharge_tariff * pyo.value(model.dsch_mwh[t])
+        (
+            discharge_tariff * (pyo.value(model.dsch_mwh[t]) - pyo.value(model.ch_mwh[t]))
+            + (charge_tariff + discharge_tariff) * pyo.value(model.ch_grid_mwh[t])
+            if generation_mwh is not None
+            else charge_tariff * pyo.value(model.ch_mwh[t])
+            + discharge_tariff * pyo.value(model.dsch_mwh[t])
+        )
         for t in range(Tn)
     )
     if abs(spot_gross - tariff_component - total_profit) > 1e-4 * max(1.0, abs(total_profit)):
@@ -307,6 +475,7 @@ def main() -> None:
         round_trip_efficiency=rte,
         charge_tariff=charge_tariff,
         discharge_tariff=discharge_tariff,
+        generation_mwh=generation_mwh,
     )
 
     print(f"Spot revenue (price × net grid MWh, before tariffs): {spot_gross:.6g} €")
