@@ -83,6 +83,11 @@ def spec_optional_float(spec: dict[str, str], key: str) -> float | None:
     return float(spec[key])
 
 
+def spec_optional_str(spec: dict[str, str], key: str) -> str | None:
+    val = spec.get(key, "").strip()
+    return val if val else None
+
+
 def spec_str(spec: dict[str, str], key: str) -> str:
     if key not in spec:
         sys.exit(f"Missing required key in specification.txt: {key}")
@@ -115,6 +120,22 @@ def load_profile_csv(path: Path, max_mw: float) -> list[float]:
     return (cf * max_mw * INTERVAL_HOURS).tolist()
 
 
+def load_tariff_csv(path: Path) -> list[float]:
+    """Load a single-column, headerless consumption tariff time-series CSV.
+
+    Each row is the charge tariff in €/MWh for one timestep (same positional layout
+    as the prices CSV).  When this series is supplied it replaces the scalar
+    charge_tariff from the spec for every timestep.
+    """
+    df = pd.read_csv(path, header=None)
+    if df.shape[1] < 1:
+        sys.exit(f"No columns in {path}")
+    s = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
+    if s.empty:
+        sys.exit(f"No numeric tariff values in {path}")
+    return s.astype(float).tolist()
+
+
 def build_and_solve(
     prices: list[float],
     *,
@@ -126,6 +147,7 @@ def build_and_solve(
     max_cycles: float | None,
     generation_mwh: list[float] | None = None,
     grid_connection_mw: float | None = None,
+    consumption_tariffs: list[float] | None = None,
 ) -> tuple[pyo.ConcreteModel, pyo.SolverResults]:
     rte = round_trip_efficiency
     if not (0 < rte <= 1):
@@ -141,6 +163,13 @@ def build_and_solve(
                 f"price series length ({T}). Align the two CSVs to the same period."
             )
 
+    if consumption_tariffs is not None:
+        if len(consumption_tariffs) != T:
+            sys.exit(
+                f"Consumption tariff series length ({len(consumption_tariffs)}) does not match "
+                f"price series length ({T}). Align the two CSVs to the same period."
+            )
+
     eta_leg = math.sqrt(rte)
     cap = capacity_mwh
     dt = INTERVAL_HOURS
@@ -153,6 +182,10 @@ def build_and_solve(
     m = pyo.ConcreteModel()
     m.T = pyo.Set(initialize=times)
     m.price = pyo.Param(m.T, initialize={t: prices[t] for t in times})
+
+    # Per-timestep consumption tariff: replaces scalar charge_tariff when supplied.
+    if consumption_tariffs is not None:
+        m.ctariff = pyo.Param(m.T, initialize={t: consumption_tariffs[t] for t in times})
 
     m.soc_mwh = pyo.Var(m.T, bounds=(0.0, cap))
     m.ch_mwh = pyo.Var(m.T, bounds=(0.0, max_mwh))
@@ -227,10 +260,26 @@ def build_and_solve(
             #            - discharge_tariff*ch_mwh + discharge_tariff*ch_grid
             #          = (charge_tariff + discharge_tariff)*ch_grid
             #            + discharge_tariff*(dsch - ch_mwh)
+            if consumption_tariffs is not None:
+                # Per-timestep tariff replaces scalar charge_tariff for the grid-charged share.
+                return sum(
+                    mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
+                    - discharge_tariff * (mm.dsch_mwh[t] - mm.ch_mwh[t])
+                    - (mm.ctariff[t] + discharge_tariff) * mm.ch_grid_mwh[t]
+                    for t in times
+                )
             return sum(
                 mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
                 - discharge_tariff * (mm.dsch_mwh[t] - mm.ch_mwh[t])
                 - (charge_tariff + discharge_tariff) * mm.ch_grid_mwh[t]
+                for t in times
+            )
+        if consumption_tariffs is not None:
+            # Per-timestep tariff replaces scalar charge_tariff.
+            return sum(
+                mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
+                - discharge_tariff * mm.dsch_mwh[t]
+                - mm.ctariff[t] * mm.ch_mwh[t]
                 for t in times
             )
         return sum(
@@ -259,6 +308,7 @@ def write_output(
     charge_tariff: float,
     discharge_tariff: float,
     generation_mwh: list[float] | None = None,
+    consumption_tariffs: list[float] | None = None,
 ) -> None:
     eta_leg = math.sqrt(round_trip_efficiency)
     rows = []
@@ -271,6 +321,8 @@ def write_output(
         soc_mwh_val = pyo.value(model.soc_mwh[t])
         soc_frac = soc_mwh_val / capacity_mwh
         p = prices[t]
+        # Effective charge tariff for this timestep: per-timestep series takes precedence.
+        eff_charge_tariff = consumption_tariffs[t] if consumption_tariffs is not None else charge_tariff
 
         if generation_mwh is not None:
             # Taxable share of charging: grid import above available generation.
@@ -279,7 +331,7 @@ def write_output(
             revenue = (
                 p * (dsch_grid - ch_grid)
                 - discharge_tariff * dsch_grid
-                - charge_tariff * ch_grid_taxable
+                - eff_charge_tariff * ch_grid_taxable
             )
         else:
             ch_grid_taxable = ch_grid
@@ -287,7 +339,7 @@ def write_output(
             revenue = (
                 p * (dsch_grid - ch_grid)
                 - discharge_tariff * dsch_grid
-                - charge_tariff * ch_grid
+                - eff_charge_tariff * ch_grid
             )
 
         cumulative_revenue += revenue
@@ -364,6 +416,10 @@ def main() -> None:
     capacity_mwh = spec_float(spec, "capacity_mwh")
     grid_connection_mw = spec_optional_float(spec, "grid_connection_mw")
 
+    # Optional per-timestep consumption tariff CSV (overrides scalar charge_tariff when set).
+    consumption_tariff_csv = spec_optional_str(spec, "consumption_tariff_csv")
+    consumption_tariffs: list[float] | None = None
+
     # Co-location: enabled by uncommenting generation_profile_csv in the spec.
     # generation_max_mw must also be set when the profile is active.
     gen_profile_csv = spec.get("generation_profile_csv", "").strip()
@@ -394,6 +450,19 @@ def main() -> None:
         sys.exit("max_cycles must be non-negative")
     prices = load_prices_csv(prices_path)
 
+    if consumption_tariff_csv is not None:
+        consumption_tariffs = load_tariff_csv(Path(consumption_tariff_csv))
+        if len(consumption_tariffs) != len(prices):
+            sys.exit(
+                f"Consumption tariff series length ({len(consumption_tariffs)}) does not match "
+                f"price series length ({len(prices)}). Align the two CSVs to the same period."
+            )
+        print(
+            f"Consumption tariff: per-timestep series loaded from '{consumption_tariff_csv}' "
+            f"({len(consumption_tariffs)} timesteps); scalar charge_tariff ignored.",
+            flush=True,
+        )
+
     if grid_connection_mw is not None:
         effective_max = min(power_mw, grid_connection_mw)
         print(
@@ -421,6 +490,7 @@ def main() -> None:
         max_cycles=max_cycles,
         generation_mwh=generation_mwh,
         grid_connection_mw=grid_connection_mw,
+        consumption_tariffs=consumption_tariffs,
     )
 
     ok = (
@@ -443,9 +513,13 @@ def main() -> None:
     tariff_component = sum(
         (
             discharge_tariff * (pyo.value(model.dsch_mwh[t]) - pyo.value(model.ch_mwh[t]))
-            + (charge_tariff + discharge_tariff) * pyo.value(model.ch_grid_mwh[t])
+            + (
+                (consumption_tariffs[t] if consumption_tariffs is not None else charge_tariff)
+                + discharge_tariff
+            ) * pyo.value(model.ch_grid_mwh[t])
             if generation_mwh is not None
-            else charge_tariff * pyo.value(model.ch_mwh[t])
+            else (consumption_tariffs[t] if consumption_tariffs is not None else charge_tariff)
+            * pyo.value(model.ch_mwh[t])
             + discharge_tariff * pyo.value(model.dsch_mwh[t])
         )
         for t in range(Tn)
@@ -476,6 +550,7 @@ def main() -> None:
         charge_tariff=charge_tariff,
         discharge_tariff=discharge_tariff,
         generation_mwh=generation_mwh,
+        consumption_tariffs=consumption_tariffs,
     )
 
     print(f"Spot revenue (price × net grid MWh, before tariffs): {spot_gross:.6g} €")

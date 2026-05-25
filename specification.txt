@@ -14,8 +14,14 @@ capacity_mwh = 2
 round_trip_efficiency = 0.9
 
 # Extra cost per MWh charged / discharged (same units as prices); omit or set 0 to disable
-charge_tariff = 10
-discharge_tariff = 1
+#charge_tariff = 0
+discharge_tariff = 2.51
+
+# Optional: per-timestep consumption tariff time-series (€/MWh).
+# Single-column, headerless CSV — one value per timestep, same layout as prices_csv.
+# When set, this series overrides the scalar charge_tariff above for every timestep.
+# Uncomment and set the path to enable.
+consumption_tariff_csv = inputs/tariffs_consumption_b-high_DK1_1h_2026.csv
 
 # Optional: max equivalent cycles: √(round_trip_efficiency) × sum(grid charge MWh) / capacity_mwh (stored charge / capacity).
 # Comment out or remove to disable.
@@ -23,7 +29,7 @@ discharge_tariff = 1
 
 # Optional: grid connection limit in MW. Both grid imports (charging) and grid exports (discharging)
 # are capped at this value each timestep. If omitted, only the BESS rated power applies.
-grid_connection_mw = 2
+grid_connection_mw = 1
 
 # --- Co-location (optional) ---
 # Uncomment generation_profile_csv to enable co-location mode.
@@ -33,5 +39,5 @@ grid_connection_mw = 2
 # when generation_profile_csv is set.
 # In co-location mode BESS discharge (grid export) is capped at generation_max_mw × capacity_factor
 # each timestep. Grid import for charging is unaffected.
-generation_profile_csv = inputs/solar_profile_Denmark_1h_2024.csv
-generation_max_mw = 2
+#generation_profile_csv = inputs/solar_profile_Denmark_1h_2024.csv
+#generation_max_mw = 2
