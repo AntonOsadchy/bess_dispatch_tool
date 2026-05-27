@@ -1,11 +1,11 @@
 # BESS dispatch — key = value (lines starting with # ignored)
 
-prices_csv = inputs/prices.csv
+prices_csv = inputs/prices_spot_DK1_1h_2025.csv
 output_csv = outputs/dispatch_results.csv
 # One price row = one hour (interval length is fixed in src/bess_dispatch_opt.py).
 
 # Rated AC power MW; max grid MWh per row = power * interval_hours (interval_hours is 1.0 in code).
-power = 0.25
+power = 1
 
 # Usable energy capacity MWh
 capacity_mwh = 2
@@ -14,9 +14,30 @@ capacity_mwh = 2
 round_trip_efficiency = 0.9
 
 # Extra cost per MWh charged / discharged (same units as prices); omit or set 0 to disable
-charge_tariff = 10
-discharge_tariff = 0
+#charge_tariff = 0
+discharge_tariff = 2.51
 
-# Optional: max equivalent cycles: √(round_trip_efficiency) × sum(grid charge MWh) / capacity_mwh (stored charge / capacity). Entire line
-# must be active (no leading # on max_cycles) or the cap is not applied.
+# Optional: per-timestep consumption tariff time-series (€/MWh).
+# Single-column, headerless CSV — one value per timestep, same layout as prices_csv.
+# When set, this series overrides the scalar charge_tariff above for every timestep.
+# Uncomment and set the path to enable.
+consumption_tariff_csv = inputs/tariffs_consumption_b-high_DK1_1h_2026.csv
+
+# Optional: max equivalent cycles: √(round_trip_efficiency) × sum(grid charge MWh) / capacity_mwh (stored charge / capacity).
+# Comment out or remove to disable.
 #max_cycles = 365
+
+# Optional: grid connection limit in MW. Both grid imports (charging) and grid exports (discharging)
+# are capped at this value each timestep. If omitted, only the BESS rated power applies.
+grid_connection_mw = 1
+
+# --- Co-location (optional) ---
+# Uncomment generation_profile_csv to enable co-location mode.
+# The file must be a single-column, headerless CSV of capacity factors [0–1], one row per timestep
+# (same layout as the prices CSV, e.g. solar_profile_Denmark_1h_2024.csv).
+# generation_max_mw is the nameplate capacity of the co-located generator (MW); it is required
+# when generation_profile_csv is set.
+# In co-location mode BESS discharge (grid export) is capped at generation_max_mw × capacity_factor
+# each timestep. Grid import for charging is unaffected.
+#generation_profile_csv = inputs/solar_profile_Denmark_1h_2024.csv
+#generation_max_mw = 2
