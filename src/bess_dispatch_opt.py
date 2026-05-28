@@ -409,6 +409,7 @@ def write_output(
     discharge_tariff: float,
     generation_mwh: list[float] | None = None,
     consumption_tariffs: list[float] | None = None,
+    curtailment_tariffs: list[float] | None = None,
 ) -> None:
     eta_leg = math.sqrt(round_trip_efficiency)
     rows = []
@@ -460,6 +461,25 @@ def write_output(
             row["generation_mw"] = generation_mwh[t] / INTERVAL_HOURS
             row["charge_btm_mwh"] = ch_btm           # charged from generation (no tariff)
             row["charge_grid_mwh"] = ch_grid_taxable  # charged from grid (tariff applied)
+
+            # Generation revenue columns.
+            # Curtailment threshold: per-timestep tariff series if available, else scalar.
+            threshold = (
+                curtailment_tariffs[t]
+                if curtailment_tariffs is not None
+                else charge_tariff
+            )
+            gen_mwh_t = generation_mwh[t]
+            gen_rev_uncurtailed = p * gen_mwh_t
+            curtailed = p <= threshold
+            gen_gen_curtailed = 0.0 if curtailed else gen_mwh_t
+            gen_rev_curtailed = 0.0 if curtailed else p * gen_mwh_t
+
+            row["generation_mwh"] = gen_mwh_t
+            row["generation_revenue_uncurtailed"] = gen_rev_uncurtailed
+            row["generation_curtailed_mwh"] = gen_gen_curtailed
+            row["generation_revenue_curtailed"] = gen_rev_curtailed
+
         rows.append(row)
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(path, index=False)
@@ -527,11 +547,6 @@ def main() -> None:
     if grid_import_mw is None and grid_export_mw is None and grid_connection_mw is not None:
         grid_import_mw = grid_connection_mw
         grid_export_mw = grid_connection_mw
-        print(
-            f"Note: grid_connection_mw={grid_connection_mw} MW used for both import and export "
-            "(legacy key). Use grid_import_mw / grid_export_mw to set them independently.",
-            flush=True,
-        )
 
     # Optional per-timestep consumption tariff CSV (overrides scalar charge_tariff when set).
     consumption_tariff_csv = spec_optional_str(spec, "consumption_tariff_csv")
@@ -552,10 +567,6 @@ def main() -> None:
         if gen_max_mw <= 0:
             sys.exit("generation_max_mw must be positive")
         generation_mwh = load_profile_csv(Path(gen_profile_csv), gen_max_mw)
-        print(
-            f"Co-location mode: profile={gen_profile_csv}, generation_max_mw={gen_max_mw} MW",
-            flush=True,
-        )
 
     if power_mw <= 0:
         sys.exit("power must be positive")
@@ -576,35 +587,6 @@ def main() -> None:
                 f"Consumption tariff series length ({len(consumption_tariffs)}) does not match "
                 f"price series length ({len(prices)}). Align the two CSVs to the same period."
             )
-        print(
-            f"Consumption tariff: per-timestep series loaded from '{consumption_tariff_csv}' "
-            f"({len(consumption_tariffs)} timesteps); scalar charge_tariff ignored.",
-            flush=True,
-        )
-
-    if grid_import_mw is not None:
-        effective_import = min(power_mw, grid_import_mw)
-        print(
-            f"Grid import cap: {grid_import_mw} MW "
-            f"(effective: {effective_import} MW per interval)",
-            flush=True,
-        )
-    if grid_export_mw is not None:
-        effective_export = min(power_mw, grid_export_mw)
-        print(
-            f"Grid export cap: {grid_export_mw} MW "
-            f"(effective: {effective_export} MW per interval)",
-            flush=True,
-        )
-
-    if max_cycles is not None:
-        print(f"Cycle cap applied: max_cycles={max_cycles}", flush=True)
-    else:
-        print(
-            "No cycle cap (omit max_cycles or leave the line commented — lines starting "
-            "with # are ignored).",
-            flush=True,
-        )
 
     model, results = build_and_solve(
         prices,
@@ -678,21 +660,119 @@ def main() -> None:
         discharge_tariff=discharge_tariff,
         generation_mwh=generation_mwh,
         consumption_tariffs=consumption_tariffs,
+        curtailment_tariffs=consumption_tariffs,
     )
 
-    print(f"Spot revenue (price × net grid MWh, before tariffs): {spot_gross:.6g} €")
-    print(f"Tariff charges (on grid MWh): {tariff_component:.6g} €")
-    print(f"Total profit (net arbitrage, horizon): {total_profit:.6g} €")
-    print(f"Equivalent full cycles (charge-based): {n_cycles:.6g} cycles")
-    if math.isnan(profit_per_cycle):
-        print("Profit per cycle: n/a (zero cycles) [€/cycle]")
+    # -------------------------------------------------------------------------
+    # Build report lines (written to terminal and .txt file)
+    # -------------------------------------------------------------------------
+    report_lines: list[str] = []
+
+    # --- Inputs summary ---
+    report_lines.append("--- Inputs ---")
+    report_lines.append(f"  Prices CSV                           : {prices_path}")
+    report_lines.append(f"  Timesteps                            : {len(prices):>10d} h")
+    report_lines.append(f"  Price mean                           : {sum(prices)/len(prices):>10.2f} €/MWh")
+    report_lines.append(f"  Price min                            : {min(prices):>10.2f} €/MWh")
+    report_lines.append(f"  Price max                            : {max(prices):>10.2f} €/MWh")
+    report_lines.append(f"  Hours with negative price            : {sum(1 for p in prices if p < 0):>10d} h")
+    if consumption_tariff_csv is not None:
+        ct_mean = sum(consumption_tariffs) / len(consumption_tariffs)
+        ct_min  = min(consumption_tariffs)
+        ct_max  = max(consumption_tariffs)
+        report_lines.append(f"  Charge tariff (mean / min / max)     : {ct_mean:>6.2f} / {ct_min:.2f} / {ct_max:.2f} €/MWh")
     else:
-        print(f"Profit per cycle: {profit_per_cycle:.6g} €/cycle")
-    print(
-        f"Profit 365 cycles normalized (total profit / 365): "
-        f"{profit_365_cycles_normalized:.6g} € (≈ €/cycle if 365 cycles/yr)"
-    )
-    print(f"Wrote {output_path.resolve()}")
+        report_lines.append(f"  Charge tariff                        : {charge_tariff:>10.2f} €/MWh")
+    report_lines.append(f"  Discharge tariff                     : {discharge_tariff:>10.2f} €/MWh")
+    report_lines.append("")
+    report_lines.append(f"  BESS power                           : {power_mw:>10.2f} MW")
+    report_lines.append(f"  BESS capacity                        : {capacity_mwh:>10.2f} MWh")
+    report_lines.append(f"  Round-trip efficiency                : {rte*100:>10.1f} %")
+    report_lines.append(f"  Grid import cap                      : {grid_import_mw if grid_import_mw is not None else power_mw:>10.2f} MW")
+    report_lines.append(f"  Grid export cap                      : {grid_export_mw if grid_export_mw is not None else power_mw:>10.2f} MW")
+    report_lines.append(f"  Max cycles                           : {'unlimited' if max_cycles is None else f'{max_cycles:>6.0f}':>10}")
+    if generation_mwh is not None:
+        gen_total = sum(generation_mwh)
+        gen_peak  = max(generation_mwh)
+        gen_hours = sum(1 for g in generation_mwh if g > 0)
+        report_lines.append("")
+        report_lines.append(f"  Generation profile CSV               : {gen_profile_csv}")
+        report_lines.append(f"  Generation nameplate capacity        : {gen_max_mw:>10.2f} MW")
+        report_lines.append(f"  Annual generation                    : {gen_total:>10.2f} MWh")
+        report_lines.append(f"  Peak output                          : {gen_peak:>10.2f} MW")
+        report_lines.append(f"  Generating hours                     : {gen_hours:>10d} h")
+        capacity_factor = gen_total / (gen_max_mw * len(generation_mwh))
+        report_lines.append(f"  Capacity factor                      : {capacity_factor*100:>10.1f} %")
+
+    report_lines.append("")
+    report_lines.append("--- BESS Results ---")
+    report_lines.append(f"  Spot revenue (gross, before tariffs) : {spot_gross:>10.2f} €")
+    report_lines.append(f"  Tariff charges                       : {tariff_component:>10.2f} €")
+    report_lines.append(f"  Total profit                         : {total_profit:>10.2f} €")
+    report_lines.append(f"  Equivalent full cycles               : {n_cycles:>10.2f} cycles")
+    if math.isnan(profit_per_cycle):
+        report_lines.append("  Profit per cycle                     :        n/a  €/cycle")
+    else:
+        report_lines.append(f"  Profit per cycle                     : {profit_per_cycle:>10.2f} €/cycle")
+    report_lines.append(f"  Profit / 365 cycles (normalised)     : {profit_365_cycles_normalized:>10.2f} €/cycle")
+
+    # Generation Revenue Report (only when a generation profile is active)
+    if generation_mwh is not None:
+        # Curtailment threshold: per-timestep tariff if loaded, else scalar charge_tariff.
+        curtailment_tariffs = consumption_tariffs  # same series used as threshold
+
+        vol_uncurtailed = 0.0
+        rev_uncurtailed = 0.0
+        vol_curtailed = 0.0
+        rev_curtailed = 0.0
+
+        for t, gen_mwh_t in enumerate(generation_mwh):
+            p = prices[t]
+            threshold = curtailment_tariffs[t] if curtailment_tariffs is not None else charge_tariff
+
+            vol_uncurtailed += gen_mwh_t
+            rev_uncurtailed += p * gen_mwh_t
+
+            if p > threshold:
+                vol_curtailed += gen_mwh_t
+                rev_curtailed += p * gen_mwh_t
+
+        capture_price_uncurtailed = (
+            rev_uncurtailed / vol_uncurtailed if vol_uncurtailed > 1e-12 else float("nan")
+        )
+        capture_price_curtailed = (
+            rev_curtailed / vol_curtailed if vol_curtailed > 1e-12 else float("nan")
+        )
+
+        report_lines.append("")
+        report_lines.append("--- Generation Revenue Report ---")
+        report_lines.append("Uncurtailed (production at all prices, including negative):")
+        report_lines.append(f"  Generation volume                    : {vol_uncurtailed:>10.2f} MWh")
+        report_lines.append(f"  Total revenue                        : {rev_uncurtailed:>10.2f} €")
+        if math.isnan(capture_price_uncurtailed):
+            report_lines.append("  Capture price                        :        n/a  €/MWh  (zero generation)")
+        else:
+            report_lines.append(f"  Capture price                        : {capture_price_uncurtailed:>10.2f} €/MWh")
+        report_lines.append("")
+        report_lines.append("Curtailed (no production when price ≤ tariff):")
+        report_lines.append(f"  Generation volume                    : {vol_curtailed:>10.2f} MWh")
+        report_lines.append(f"  Total revenue                        : {rev_curtailed:>10.2f} €")
+        if math.isnan(capture_price_curtailed):
+            report_lines.append("  Capture price                        :        n/a  €/MWh  (zero generation)")
+        else:
+            report_lines.append(f"  Capture price                        : {capture_price_curtailed:>10.2f} €/MWh")
+
+    # Print to terminal
+    print()
+    for line in report_lines:
+        print(line)
+
+    # Write to .txt file alongside the CSV output
+    report_path = output_path.with_suffix(".txt")
+    report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+    print(f"\nWrote {output_path.resolve()}")
+    print(f"Wrote {report_path.resolve()}")
 
 
 if __name__ == "__main__":
