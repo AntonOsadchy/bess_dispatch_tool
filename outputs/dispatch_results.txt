@@ -1,0 +1,42 @@
+--- Inputs ---
+  Prices CSV                           : inputs/prices_spot_DK1_1h_2025.csv
+  Timesteps                            :       8760 h
+  Price mean                           :      81.11 €/MWh
+  Price min                            :     -38.14 €/MWh
+  Price max                            :     583.40 €/MWh
+  Hours with negative price            :        441 h
+  Charge tariff (mean / min / max)     :  10.90 / 9.21 / 18.03 €/MWh
+  Discharge tariff                     :       1.38 €/MWh
+
+  BESS power                           :       1.00 MW
+  BESS capacity                        :       2.00 MWh
+  Round-trip efficiency                :       90.0 %
+  Grid import cap                      :       1.00 MW
+  Grid export cap                      :       2.00 MW
+  Max cycles                           :  unlimited
+
+  Generation profile CSV               : inputs/solar_profile_Denmark_1h_2024.csv
+  Generation nameplate capacity        :       2.00 MW
+  Annual generation                    :    1902.56 MWh
+  Peak output                          :       1.40 MW
+  Generating hours                     :       4167 h
+  Capacity factor                      :       10.9 %
+
+--- BESS Results ---
+  Spot revenue (gross, before tariffs) :   81821.97 €
+  Tariff charges                       :    6966.59 €
+  Total profit                         :   74855.38 €
+  Equivalent full cycles               :     661.38 cycles
+  Profit per cycle                     :     113.18 €/cycle
+  Profit / 365 cycles (normalised)     :     205.08 €/cycle
+
+--- Generation Revenue Report ---
+Uncurtailed (production at all prices, including negative):
+  Generation volume                    :    1902.56 MWh
+  Total revenue                        :   87625.89 €
+  Capture price                        :      46.06 €/MWh
+
+Curtailed (no production when price ≤ tariff):
+  Generation volume                    :    1174.16 MWh
+  Total revenue                        :   88013.97 €
+  Capture price                        :      74.96 €/MWh

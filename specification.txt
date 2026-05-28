@@ -23,17 +23,13 @@ discharge_tariff = 1.38
 # Uncomment and set the path to enable.
 consumption_tariff_csv = inputs/tariffs_consumption_energinet_DK1_1h_2026.csv
 
-# Optional: max equivalent cycles: √(round_trip_efficiency) × sum(grid charge MWh) / capacity_mwh (stored charge / capacity).
-# Comment out or remove to disable.
-max_cycles = 100
-
 # Optional: grid connection import capacity in MW.
 # Limits how much the BESS can charge from the grid each timestep.
 # In co-located mode the BESS can also charge behind the meter from the generation profile,
 # up to gen_avail[t]; grid import adds on top of that, capped here. Total charging is still
 # bounded by the BESS rated power (power = above).
 # If omitted, only the BESS rated power applies.
-grid_import_mw = 0
+grid_import_mw = 1
 
 # Optional: grid connection export capacity in MW.
 # Limits how much the BESS can discharge to the grid each timestep.
@@ -53,3 +49,8 @@ grid_export_mw = 2
 # each timestep. Grid import for charging is unaffected.
 generation_profile_csv = inputs/solar_profile_Denmark_1h_2024.csv
 generation_max_mw = 2
+
+# Optional: max equivalent cycles: √(round_trip_efficiency) × sum(grid charge MWh) / capacity_mwh (stored charge / capacity).
+# Comment out or remove to disable.
+#max_cycles = 100
+
