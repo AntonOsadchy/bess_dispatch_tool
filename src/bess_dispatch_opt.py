@@ -38,17 +38,31 @@ Three additional constraints are added in co-location mode:
      power rating caps total charging regardless of source. Grid import is separately limited
      by grid_import_mw via the ch_grid_mwh auxiliary variable (see below).
 
-  3. Round-trip tariff relief for BTM-charged energy:
-     Energy charged behind the meter (from generation, up to gen_avail[t]) avoids both the
-     charge_tariff on import and the discharge_tariff on its eventual export — it never crossed
-     the import meter and its discharge is treated as unmetered.
-     Auxiliary variable ch_grid_mwh[t] = max(0, ch_mwh[t] − gen_avail[t]) tracks the
-     taxable (grid-imported) share of charging. It is bounded above by grid_import_mw × dt
-     (the import connection cap) and pinned by:
-         ch_grid_mwh[t] ≥ ch_mwh[t] − gen_avail[t]   (active when ch > gen; forces grid import)
-         ch_grid_mwh[t] ≤ ch_mwh[t]                   (grid share ≤ total charging)
-         ch_grid_mwh[t] ≥ 0                            (from variable bound)
-     The BTM share ch_btm[t] = ch_mwh[t] − ch_grid_mwh[t] ≤ gen_avail[t] follows from the LB.
+   3. Round-trip tariff relief for BTM-charged energy:
+      Energy charged behind the meter avoids both the charge_tariff on import and the
+      discharge_tariff on its eventual export — it never crossed the import meter and its
+      discharge is treated as unmetered.  There are two BTM sources:
+
+        a) gen_avail[t] = min(generation_mwh[t], export_connection_dt)
+           The portion of generation that occupies (or would occupy) the export connection.
+
+        b) surplus_gen[t] = max(0, generation_mwh[t] − export_connection_dt)
+           Generation that exceeds the export connection capacity and therefore CANNOT be
+           exported.  This "clipped" surplus is available to the BESS at zero cost and is
+           fully exempt from both charge_tariff and discharge_tariff (same BTM treatment).
+
+      Auxiliary variable ch_grid_mwh[t] = max(0, ch_mwh[t] − gen_avail[t] − surplus_gen[t])
+      tracks the taxable (grid-imported) share of charging. It is bounded above by
+      grid_import_mw × dt (the import connection cap) and pinned by:
+          ch_grid_mwh[t] ≥ ch_mwh[t] − gen_avail[t] − surplus_gen[t]
+                                        (forces grid import only when charging exceeds both
+                                         BTM sources; combined with [B4] this pins
+                                         ch_grid_mwh[t] = max(0, ch_mwh[t] − gen_avail[t]
+                                                                              − surplus_gen[t]))
+          ch_grid_mwh[t] ≤ ch_mwh[t]   (grid share ≤ total charging)
+          ch_grid_mwh[t] ≥ 0            (from variable bound)
+      The full BTM share ch_btm[t] = ch_mwh[t] − ch_grid_mwh[t]
+                                    ≤ gen_avail[t] + surplus_gen[t] follows from the LB.
      Objective tariff terms in co-location mode:
          − (charge_tariff + discharge_tariff) × ch_grid_mwh[t]
          − discharge_tariff × (dsch_mwh[t] − ch_mwh[t])
@@ -263,11 +277,14 @@ def build_and_solve(
     #          export_connection_dt = grid_export_mw × dt or power_mw × dt;
     #          gen_avail[t] = min(generation_mwh[t], export_connection_dt))
     #
-    #   [C4]  ch_grid_mwh[t] >= ch_mwh[t] − gen_avail[t]
-    #         (lower bound on grid import: forces ch_grid_mwh > 0 when total
-    #          charging exceeds available solar; combined with [B4] this pins
-    #          ch_grid_mwh[t] = max(0, ch_mwh[t] − gen_avail[t]);
-    #          rearranged: BTM share ch_mwh[t] − ch_grid_mwh[t] <= gen_avail[t])
+#   [C4]  ch_grid_mwh[t] >= ch_mwh[t] − gen_avail[t] − surplus_gen[t]
+#         (lower bound on grid import: forces ch_grid_mwh > 0 only when total
+#          charging exceeds both BTM sources (gen_avail + surplus_gen); combined
+#          with [B4] this pins ch_grid_mwh[t] = max(0, ch_mwh[t]
+#                                                       − gen_avail[t] − surplus_gen[t]);
+#          where surplus_gen[t] = max(0, generation_mwh[t] − export_connection_dt)
+#          is the clipped generation that cannot be exported and is free to charge the BESS;
+#          rearranged: BTM share ch_mwh[t] − ch_grid_mwh[t] <= gen_avail[t] + surplus_gen[t])
     #
     #   [C5]  ch_grid_mwh[t] <= ch_mwh[t]
     #         (grid import cannot exceed total charging; prevents ch_grid_mwh
@@ -330,6 +347,11 @@ def build_and_solve(
         gen_param = {t: min(generation_mwh[t], export_connection_dt) for t in times}
         m.gen_avail = pyo.Param(m.T, initialize=gen_param)
 
+        # Surplus generation: clipped portion that cannot be exported (free BTM charging source).
+        # surplus_gen[t] = max(0, generation_mwh[t] − export_connection_dt)
+        surplus_param = {t: max(0.0, generation_mwh[t] - export_connection_dt) for t in times}
+        m.surplus_gen = pyo.Param(m.T, initialize=surplus_param)
+
         def colocation_rule(mm, t):
             return mm.dsch_mwh[t] <= export_connection_dt - mm.gen_avail[t]
 
@@ -339,7 +361,9 @@ def build_and_solve(
         m.ch_grid_mwh = pyo.Var(m.T, bounds=(0.0, max_grid_import_mwh))
 
         def ch_grid_lb_rule(mm, t):
-            return mm.ch_grid_mwh[t] >= mm.ch_mwh[t] - mm.gen_avail[t]
+            # Grid import is only needed when charging exceeds both BTM sources
+            # (exportable generation gen_avail[t] and free surplus surplus_gen[t]).
+            return mm.ch_grid_mwh[t] >= mm.ch_mwh[t] - mm.gen_avail[t] - mm.surplus_gen[t]
 
         m.ch_grid_lb = pyo.Constraint(m.T, rule=ch_grid_lb_rule)  # [C4]
 
@@ -410,6 +434,7 @@ def write_output(
     generation_mwh: list[float] | None = None,
     consumption_tariffs: list[float] | None = None,
     curtailment_tariffs: list[float] | None = None,
+    surplus_generation_mwh: list[float] | None = None,
 ) -> None:
     eta_leg = math.sqrt(round_trip_efficiency)
     rows = []
@@ -461,6 +486,11 @@ def write_output(
             row["generation_mw"] = generation_mwh[t] / INTERVAL_HOURS
             row["charge_btm_mwh"] = ch_btm           # charged from generation (no tariff)
             row["charge_grid_mwh"] = ch_grid_taxable  # charged from grid (tariff applied)
+
+            # Surplus charging: portion of BTM charging sourced from clipped (unexportable) generation.
+            if surplus_generation_mwh is not None:
+                surplus_avail = surplus_generation_mwh[t]
+                row["charge_surplus_mwh"] = min(ch_btm, surplus_avail)
 
             # Generation revenue columns.
             # Curtailment threshold: per-timestep tariff series if available, else scalar.
@@ -568,6 +598,17 @@ def main() -> None:
             sys.exit("generation_max_mw must be positive")
         generation_mwh = load_profile_csv(Path(gen_profile_csv), gen_max_mw)
 
+    # Surplus generation: clipped portion that cannot be exported (free BTM charging for BESS).
+    # Computed here (after grid_export_mw is resolved) and passed through to write_output.
+    # surplus_gen[t] = max(0, generation_mwh[t] − export_connection_dt)
+    surplus_generation_mwh: list[float] | None = None
+    if generation_mwh is not None:
+        export_connection_dt_main = (
+            grid_export_mw if grid_export_mw is not None else power_mw
+        ) * INTERVAL_HOURS
+        surplus_generation_mwh = [
+            max(0.0, g - export_connection_dt_main) for g in generation_mwh
+        ]
     if power_mw <= 0:
         sys.exit("power must be positive")
     if capacity_mwh <= 0:
@@ -614,24 +655,61 @@ def main() -> None:
 
     total_profit = pyo.value(model.obj)
     Tn = len(prices)
-    spot_gross = sum(
-        prices[t]
-        * (pyo.value(model.dsch_mwh[t]) - pyo.value(model.ch_mwh[t]))
-        for t in range(Tn)
+
+    # Single pass over all timesteps — compute all summary stats together.
+    total_export_mwh    = 0.0
+    total_export_revenue = 0.0
+    total_charge_mwh    = 0.0
+    total_charge_cost   = 0.0   # spot cost + charge tariff on grid-imported share only
+    total_dsch_profit   = 0.0   # spot revenue minus net discharge tariff (with BTM refund)
+    spot_gross          = 0.0
+    tariff_component    = 0.0
+
+    for t in range(Tn):
+        p        = prices[t]
+        dsch     = pyo.value(model.dsch_mwh[t])
+        ch_total = pyo.value(model.ch_mwh[t])
+        eff_ct   = consumption_tariffs[t] if consumption_tariffs is not None else charge_tariff
+
+        if generation_mwh is not None:
+            ch_grid = pyo.value(model.ch_grid_mwh[t])
+            ch_btm  = ch_total - ch_grid
+        else:
+            ch_grid = ch_total
+            ch_btm  = 0.0
+
+        total_export_mwh     += dsch
+        total_export_revenue += p * dsch
+        total_charge_mwh     += ch_total
+        # Charging cost: spot + charge tariff on grid-imported share, plus spot opportunity
+        # cost on BTM share (generation that could have been exported at spot price instead).
+        total_charge_cost    += (p + eff_ct) * ch_grid + p * ch_btm
+        # Discharge profit: spot revenue minus net discharge tariff (BTM share gets refund)
+        total_dsch_profit    += p * dsch - discharge_tariff * (dsch - ch_btm)
+        spot_gross           += p * (dsch - ch_total)
+
+        if generation_mwh is not None:
+            tariff_component += (
+                discharge_tariff * (dsch - ch_total)
+                + (eff_ct + discharge_tariff) * ch_grid
+            )
+        else:
+            tariff_component += eff_ct * ch_total + discharge_tariff * dsch
+
+    weighted_avg_export_price = (
+        total_export_revenue / total_export_mwh if total_export_mwh > 1e-12 else float("nan")
     )
-    tariff_component = sum(
-        (
-            discharge_tariff * (pyo.value(model.dsch_mwh[t]) - pyo.value(model.ch_mwh[t]))
-            + (
-                (consumption_tariffs[t] if consumption_tariffs is not None else charge_tariff)
-                + discharge_tariff
-            ) * pyo.value(model.ch_grid_mwh[t])
-            if generation_mwh is not None
-            else (consumption_tariffs[t] if consumption_tariffs is not None else charge_tariff)
-            * pyo.value(model.ch_mwh[t])
-            + discharge_tariff * pyo.value(model.dsch_mwh[t])
-        )
-        for t in range(Tn)
+    weighted_avg_charge_cost = (
+        total_charge_cost / total_charge_mwh if total_charge_mwh > 1e-12 else float("nan")
+    )
+    weighted_avg_dsch_profit = (
+        total_dsch_profit / total_export_mwh if total_export_mwh > 1e-12 else float("nan")
+    )
+    validation_profit = (
+        total_export_mwh * weighted_avg_dsch_profit
+        - total_charge_mwh * weighted_avg_charge_cost
+        if not (math.isnan(weighted_avg_dsch_profit) or math.isnan(weighted_avg_charge_cost))
+        else float("nan")
     )
     if abs(spot_gross - tariff_component - total_profit) > 1e-4 * max(1.0, abs(total_profit)):
         print(
@@ -650,6 +728,17 @@ def main() -> None:
     # Profit normalised to 365 cycles: total profit divided by 365.
     profit_365_cycles_normalized = total_profit / 365.0
 
+    # Total energy charged from surplus (clipped) generation — co-location only.
+    total_surplus_charged_mwh: float | None = None
+    if surplus_generation_mwh is not None:
+        eta_leg_val = math.sqrt(rte)
+        total_surplus_charged_mwh = 0.0
+        for t in range(len(prices)):
+            ch_total = pyo.value(model.ch_mwh[t])
+            ch_grid = pyo.value(model.ch_grid_mwh[t])
+            ch_btm = ch_total - ch_grid
+            total_surplus_charged_mwh += min(ch_btm, surplus_generation_mwh[t])
+
     write_output(
         output_path,
         prices,
@@ -661,6 +750,7 @@ def main() -> None:
         generation_mwh=generation_mwh,
         consumption_tariffs=consumption_tariffs,
         curtailment_tariffs=consumption_tariffs,
+        surplus_generation_mwh=surplus_generation_mwh,
     )
 
     # -------------------------------------------------------------------------
@@ -709,14 +799,33 @@ def main() -> None:
     report_lines.append(f"  Spot revenue (gross, before tariffs) : {spot_gross:>10.2f} €")
     report_lines.append(f"  Tariff charges                       : {tariff_component:>10.2f} €")
     report_lines.append(f"  Total profit                         : {total_profit:>10.2f} €")
+    report_lines.append(f"  Charging volume                      : {total_charge_mwh:>10.2f} MWh")
+    if math.isnan(weighted_avg_charge_cost):
+        report_lines.append("  Weighted avg charging cost           :        n/a  €/MWh")
+    else:
+        report_lines.append(f"  Weighted avg charging cost           : {weighted_avg_charge_cost:>10.2f} €/MWh")
+    report_lines.append(f"  Discharging volume                   : {total_export_mwh:>10.2f} MWh")
+    if math.isnan(weighted_avg_dsch_profit):
+        report_lines.append("  Weighted avg discharge profit        :        n/a  €/MWh")
+    else:
+        report_lines.append(f"  Weighted avg discharge profit        : {weighted_avg_dsch_profit:>10.2f} €/MWh")
+    if math.isnan(validation_profit):
+        report_lines.append("  Vol × avg price cross-check          :        n/a  €")
+    else:
+        report_lines.append(f"  Vol × avg price cross-check          : {validation_profit:>10.2f} €")
     report_lines.append(f"  Equivalent full cycles               : {n_cycles:>10.2f} cycles")
     if math.isnan(profit_per_cycle):
         report_lines.append("  Profit per cycle                     :        n/a  €/cycle")
+        report_lines.append("  Profit per cycle per MW              :        n/a  €/cycle/MW")
     else:
         report_lines.append(f"  Profit per cycle                     : {profit_per_cycle:>10.2f} €/cycle")
+        report_lines.append(f"  Profit per cycle per MW              : {profit_per_cycle / power_mw:>10.2f} €/cycle/MW")
     report_lines.append(f"  Profit / 365 cycles (normalised)     : {profit_365_cycles_normalized:>10.2f} €/cycle")
+    report_lines.append(f"  Profit / 365 cycles per MW           : {profit_365_cycles_normalized / power_mw:>10.2f} €/cycle/MW")
+    if total_surplus_charged_mwh is not None:
+        report_lines.append(f"  BESS charged from surplus generation : {total_surplus_charged_mwh:>10.2f} MWh")
 
-    # Generation Revenue Report (only when a generation profile is active)
+    # Combined system (BESS + generation) — co-location only.
     if generation_mwh is not None:
         # Curtailment threshold: per-timestep tariff if loaded, else scalar charge_tariff.
         curtailment_tariffs = consumption_tariffs  # same series used as threshold
@@ -744,6 +853,24 @@ def main() -> None:
             rev_curtailed / vol_curtailed if vol_curtailed > 1e-12 else float("nan")
         )
 
+        # Combined table uses curtailed generation (price > tariff hours only).
+        combined_export_mwh = total_export_mwh + vol_curtailed
+        combined_export_revenue = total_export_revenue + rev_curtailed
+        combined_avg_export_price = (
+            combined_export_revenue / combined_export_mwh
+            if combined_export_mwh > 1e-12
+            else float("nan")
+        )
+        report_lines.append("")
+        report_lines.append("--- Combined System (BESS + Generation) ---")
+        report_lines.append(f"  {'Source':<36} : {'Volume (MWh)':>12} | {'Avg price (€/MWh)':>17}")
+        report_lines.append(f"  {'Direct generation export (curtailed)':<36} : {vol_curtailed:>12.2f} | {capture_price_curtailed:>17.2f}")
+        report_lines.append(f"  {'BESS export':<36} : {total_export_mwh:>12.2f} | {weighted_avg_export_price:>17.2f}")
+        report_lines.append(f"  {'Combined':<36} : {combined_export_mwh:>12.2f} | {combined_avg_export_price:>17.2f}")
+
+    # Generation Revenue Report (only when a generation profile is active)
+    if generation_mwh is not None:
+        # vol_uncurtailed/curtailed and capture prices already computed above.
         report_lines.append("")
         report_lines.append("--- Generation Revenue Report ---")
         report_lines.append("Uncurtailed (production at all prices, including negative):")
@@ -771,8 +898,39 @@ def main() -> None:
     report_path = output_path.with_suffix(".txt")
     report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
+    # Write Excel workbook: two sheets — per-timestep dispatch data and text report.
+    # Report sheet: split "  Label : value" lines into col A (label) / col B (value).
+    # Two-value lines "  Label : val1 | val2" additionally populate col C.
+    excel_path = output_path.with_suffix(".xlsx")
+
+    def _try_numeric(s: str) -> float | str:
+        """Return float if the first whitespace-separated token is numeric, else the raw string."""
+        try:
+            return float(s.strip().split()[0].replace(",", ""))
+        except (ValueError, IndexError):
+            return s.strip()
+
+    report_rows: list[tuple] = []
+    for line in report_lines:
+        if " : " in line:
+            label, _, rest = line.partition(" : ")
+            if " | " in rest:
+                left, _, right = rest.partition(" | ")
+                report_rows.append((label.rstrip(), _try_numeric(left), _try_numeric(right)))
+            else:
+                report_rows.append((label.rstrip(), _try_numeric(rest), None))
+        else:
+            report_rows.append((line, None, None))
+
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        pd.read_csv(output_path).to_excel(writer, sheet_name="Dispatch", index=False)
+        pd.DataFrame(report_rows, columns=["Label", "Value", "Value2"]).to_excel(
+            writer, sheet_name="Report", index=False, header=False
+        )
+
     print(f"\nWrote {output_path.resolve()}")
     print(f"Wrote {report_path.resolve()}")
+    print(f"Wrote {excel_path.resolve()}")
 
 
 if __name__ == "__main__":

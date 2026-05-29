@@ -8,35 +8,49 @@
   Charge tariff (mean / min / max)     :  10.90 / 9.21 / 18.03 €/MWh
   Discharge tariff                     :       1.38 €/MWh
 
-  BESS power                           :       1.00 MW
-  BESS capacity                        :       2.00 MWh
+  BESS power                           :      50.00 MW
+  BESS capacity                        :     100.00 MWh
   Round-trip efficiency                :       90.0 %
-  Grid import cap                      :       1.00 MW
-  Grid export cap                      :       2.00 MW
+  Grid import cap                      :      50.00 MW
+  Grid export cap                      :      90.00 MW
   Max cycles                           :  unlimited
 
   Generation profile CSV               : inputs/solar_profile_Denmark_1h_2024.csv
-  Generation nameplate capacity        :       2.00 MW
-  Annual generation                    :    1902.56 MWh
-  Peak output                          :       1.40 MW
+  Generation nameplate capacity        :      95.00 MW
+  Annual generation                    :   90371.60 MWh
+  Peak output                          :      66.50 MW
   Generating hours                     :       4167 h
   Capacity factor                      :       10.9 %
 
 --- BESS Results ---
-  Spot revenue (gross, before tariffs) :   81821.97 €
-  Tariff charges                       :    6966.59 €
-  Total profit                         :   74855.38 €
-  Equivalent full cycles               :     661.38 cycles
-  Profit per cycle                     :     113.18 €/cycle
-  Profit / 365 cycles (normalised)     :     205.08 €/cycle
+  Spot revenue (gross, before tariffs) : 4089556.49 €
+  Tariff charges                       :  351609.45 €
+  Total profit                         : 3737947.04 €
+  Charging volume                      :   68401.71 MWh
+  Weighted avg charging cost           :      46.64 €/MWh
+  Discharging volume                   :   61608.98 MWh
+  Weighted avg discharge profit        :     112.45 €/MWh
+  Vol × avg price cross-check          : 3737947.04 €
+  Equivalent full cycles               :     648.92 cycles
+  Profit per cycle                     :    5760.30 €/cycle
+  Profit per cycle per MW              :     115.21 €/cycle/MW
+  Profit / 365 cycles (normalised)     :   10240.95 €/cycle
+  Profit / 365 cycles per MW           :     204.82 €/cycle/MW
+  BESS charged from surplus generation :       0.00 MWh
+
+--- Combined System (BESS + Generation) ---
+  Source                               : Volume (MWh) | Avg price (€/MWh)
+  Direct generation export (curtailed) :     55772.60 |             74.96
+  BESS export                          :     61608.98 |            112.97
+  Combined                             :    117381.58 |             94.91
 
 --- Generation Revenue Report ---
 Uncurtailed (production at all prices, including negative):
-  Generation volume                    :    1902.56 MWh
-  Total revenue                        :   87625.89 €
+  Generation volume                    :   90371.60 MWh
+  Total revenue                        : 4162229.68 €
   Capture price                        :      46.06 €/MWh
 
 Curtailed (no production when price ≤ tariff):
-  Generation volume                    :    1174.16 MWh
-  Total revenue                        :   88013.97 €
+  Generation volume                    :   55772.60 MWh
+  Total revenue                        : 4180663.78 €
   Capture price                        :      74.96 €/MWh
