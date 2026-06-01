@@ -433,7 +433,6 @@ def write_output(
     discharge_tariff: float,
     generation_mwh: list[float] | None = None,
     consumption_tariffs: list[float] | None = None,
-    curtailment_tariffs: list[float] | None = None,
     surplus_generation_mwh: list[float] | None = None,
 ) -> None:
     eta_leg = math.sqrt(round_trip_efficiency)
@@ -493,12 +492,8 @@ def write_output(
                 row["charge_surplus_mwh"] = min(ch_btm, surplus_avail)
 
             # Generation revenue columns.
-            # Curtailment threshold: per-timestep tariff series if available, else scalar.
-            threshold = (
-                curtailment_tariffs[t]
-                if curtailment_tariffs is not None
-                else charge_tariff
-            )
+            # Curtailment threshold: generation is curtailed when price <= discharge_tariff.
+            threshold = discharge_tariff
             gen_mwh_t = generation_mwh[t]
             gen_rev_uncurtailed = p * gen_mwh_t
             curtailed = p <= threshold
@@ -509,6 +504,11 @@ def write_output(
             row["generation_revenue_uncurtailed"] = gen_rev_uncurtailed
             row["generation_curtailed_mwh"] = gen_gen_curtailed
             row["generation_revenue_curtailed"] = gen_rev_curtailed
+            # PV profile net of BTM BESS charging, excluding curtailed hours.
+            # gen_gen_curtailed is 0 when price <= threshold (curtailed), so the
+            # max(0, ...) clamp handles residual BTM charging in those hours.
+            row["pv_net_export_mwh"] = max(0.0, gen_gen_curtailed - ch_btm)
+            row["total_export_mwh"] = row["pv_net_export_mwh"] + dsch_grid
 
         rows.append(row)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -749,7 +749,6 @@ def main() -> None:
         discharge_tariff=discharge_tariff,
         generation_mwh=generation_mwh,
         consumption_tariffs=consumption_tariffs,
-        curtailment_tariffs=consumption_tariffs,
         surplus_generation_mwh=surplus_generation_mwh,
     )
 
@@ -827,9 +826,7 @@ def main() -> None:
 
     # Combined system (BESS + generation) — co-location only.
     if generation_mwh is not None:
-        # Curtailment threshold: per-timestep tariff if loaded, else scalar charge_tariff.
-        curtailment_tariffs = consumption_tariffs  # same series used as threshold
-
+        # Curtailment threshold: generation is curtailed when price <= discharge_tariff.
         vol_uncurtailed = 0.0
         rev_uncurtailed = 0.0
         vol_curtailed = 0.0
@@ -837,7 +834,7 @@ def main() -> None:
 
         for t, gen_mwh_t in enumerate(generation_mwh):
             p = prices[t]
-            threshold = curtailment_tariffs[t] if curtailment_tariffs is not None else charge_tariff
+            threshold = discharge_tariff
 
             vol_uncurtailed += gen_mwh_t
             rev_uncurtailed += p * gen_mwh_t
