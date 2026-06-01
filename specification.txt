@@ -1,6 +1,9 @@
 # BESS dispatch — key = value (lines starting with # ignored)
 
-prices_csv = inputs/prices_spot_DK1_1h_2025.csv
+prices_csv = [inputs/Multiple inputs/prices_modified_DK1_1h_2025.csv, 
+inputs/Multiple inputs/prices_modified_DK1_1h_2026.csv,
+inputs/Multiple inputs/prices_modified_DK1_1h_2027.csv]
+
 output_csv = outputs/dispatch_results.csv
 # One price row = one hour (interval length is fixed in src/bess_dispatch_opt.py).
 
