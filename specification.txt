@@ -5,10 +5,10 @@ output_csv = outputs/dispatch_results.csv
 # One price row = one hour (interval length is fixed in src/bess_dispatch_opt.py).
 
 # Rated AC power MW; max grid MWh per row = power * interval_hours (interval_hours is 1.0 in code).
-power = 1
+power = 50
 
 # Usable energy capacity MWh
-capacity_mwh = 2
+capacity_mwh = 100
 
 # Round-trip efficiency (0–1]: symmetric one-way efficiency is √(this). Stored MWh gained = grid_import_mwh × √η_rt; per grid MWh exported, stored drops by 1/√η_rt (so grid-to-grid round-trip = η_rt).
 round_trip_efficiency = 0.9
@@ -29,14 +29,14 @@ consumption_tariff_csv = inputs/tariffs_consumption_energinet_DK1_1h_2026.csv
 # up to gen_avail[t]; grid import adds on top of that, capped here. Total charging is still
 # bounded by the BESS rated power (power = above).
 # If omitted, only the BESS rated power applies.
-grid_import_mw = 1
+grid_import_mw = 0
 
 # Optional: grid connection export capacity in MW.
 # Limits how much the BESS can discharge to the grid each timestep.
 # In co-located mode generation already occupies part of this connection; BESS export is
 # limited to the remaining headroom: dsch_mwh[t] <= grid_export_mw - gen_avail[t].
 # If omitted, only the BESS rated power applies.
-grid_export_mw = 2
+grid_export_mw = 90
 
 
 # --- Co-location (optional) ---
@@ -48,9 +48,9 @@ grid_export_mw = 2
 # In co-location mode BESS discharge (grid export) is capped at generation_max_mw × capacity_factor
 # each timestep. Grid import for charging is unaffected.
 generation_profile_csv = inputs/solar_profile_Denmark_1h_2024.csv
-generation_max_mw = 2
+generation_max_mw = 116
 
 # Optional: max equivalent cycles: √(round_trip_efficiency) × sum(grid charge MWh) / capacity_mwh (stored charge / capacity).
 # Comment out or remove to disable.
-#max_cycles = 100
+#max_cycles = 365
 
