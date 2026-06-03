@@ -1,0 +1,56 @@
+--- Inputs ---
+  Prices CSV                           : inputs/prices_spot_DK1_1h_2025.csv
+  Timesteps                            :       8760 h
+  Price mean                           :      81.11 €/MWh
+  Price min                            :     -38.14 €/MWh
+  Price max                            :     583.40 €/MWh
+  Hours with negative price            :        441 h
+  Charge tariff (mean / min / max)     :  10.90 / 9.21 / 18.03 €/MWh
+  Discharge tariff                     :       1.38 €/MWh
+
+  BESS power                           :       1.00 MW
+  BESS capacity                        :       2.00 MWh
+  Round-trip efficiency                :       90.0 %
+  Grid import cap                      :       1.00 MW
+  Grid export cap                      :       2.00 MW
+  Max cycles                           :  unlimited
+
+  Generation profile CSV               :   disabled
+  Generation nameplate capacity        :       0.00 MW
+  Annual generation                    :       0.00 MWh
+  Peak output                          :       0.00 MW
+  Generating hours                     :          0 h
+  Capacity factor                      :        0.0 %
+
+--- BESS Results ---
+  Spot revenue (gross, before tariffs) :   81957.48 €
+  Tariff charges                       :   12947.07 €
+  Total profit                         :   69010.41 €
+  Charging volume                      :    1106.88 MWh
+  Weighted avg charging cost           :      60.04 €/MWh
+  Discharging volume                   :     997.14 MWh
+  Weighted avg discharge profit        :     135.85 €/MWh
+  Vol × avg price cross-check          :   69010.41 €
+  Equivalent full cycles               :     525.04 cycles
+  Profit per cycle                     :     131.44 €/cycle
+  Profit per cycle per MW              :     131.44 €/cycle/MW
+  Profit / 365 cycles (normalised)     :     189.07 €/cycle
+  Profit / 365 cycles per MW           :     189.07 €/cycle/MW
+  BESS charged from surplus generation :       0.00 MWh
+
+--- Combined System (BESS + Generation) ---
+  Source                               : Volume (MWh) | Avg price (€/MWh)
+  Direct generation export (curtailed) :         0.00 |               nan
+  BESS export                          :       997.14 |            137.23
+  Combined                             :       997.14 |            137.23
+
+--- Generation Revenue Report ---
+Uncurtailed (production at all prices, including negative):
+  Generation volume                    :       0.00 MWh
+  Total revenue                        :       0.00 €
+  Capture price                        :       0.00 €/MWh
+
+Curtailed (no production when price ≤ tariff):
+  Generation volume                    :       0.00 MWh
+  Total revenue                        :       0.00 €
+  Capture price                        :       0.00 €/MWh
