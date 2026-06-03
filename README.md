@@ -153,3 +153,181 @@ taxable_charge[t] = max(0, ch_mwh[t] - generation_mwh[t])
 Grid import for charging is otherwise unaffected by the generation profile.
 The output CSV gains `generation_mw`, `charge_btm_mwh`, and `charge_grid_mwh` columns.
 
+## Optimisation model
+
+### Variable bounds
+
+| Label | Constraint | Notes |
+|-------|-----------|-------|
+| **B1** | `0 ≤ soc_mwh[t] ≤ capacity_mwh` | SOC within usable battery limits |
+| **B2** | `0 ≤ ch_mwh[t] ≤ min(power_mw, grid_import_mw) × dt` (stand-alone) | Total charging bounded by BESS power rating; in stand-alone mode grid import cap applied here directly |
+| | `0 ≤ ch_mwh[t] ≤ power_mw × dt` (co-location) | In co-location mode the import cap moves to `ch_grid_mwh` — see B4 |
+| **B3** | `0 ≤ dsch_mwh[t] ≤ min(power_mw, grid_export_mw) × dt` | Grid export bounded by BESS power rating and export connection |
+| **B4** | `0 ≤ ch_grid_mwh[t] ≤ grid_import_mw × dt` (co-location only) | Grid-imported share of charging bounded by import connection; falls back to `power_mw × dt` if `grid_import_mw` not set |
+| **B5** | `0 ≤ ch_from_gen_avail[t] ≤ gen_avail[t]` (co-location only) | BTM charging from exportable generation; upper-bounded by available exportable generation per timestep |
+
+### Explicit constraints (all modes)
+
+**C1 — SOC energy balance** (`η_leg = √round_trip_efficiency`):
+
+Stand-alone:
+
+```
+soc_mwh[0] = SOC_INITIAL × capacity_mwh + ch_mwh[0] × η_leg − dsch_mwh[0] / η_leg
+soc_mwh[t] = soc_mwh[t-1]              + ch_mwh[t] × η_leg − dsch_mwh[t] / η_leg   ∀ t > 0
+```
+
+Co-location (charging expanded into three sources):
+
+```
+soc_mwh[0] = SOC_INITIAL × capacity_mwh
+           + (ch_grid_mwh[0] + ch_from_gen_avail[0] + ch_from_surplus_gen[0]) × η_leg
+           − dsch_mwh[0] / η_leg
+
+soc_mwh[t] = soc_mwh[t-1]
+           + (ch_grid_mwh[t] + ch_from_gen_avail[t] + ch_from_surplus_gen[t]) × η_leg
+           − dsch_mwh[t] / η_leg   ∀ t > 0
+```
+
+where the three charging terms correspond to the sources defined in the table above:
+
+| Term | Source |
+|------|--------|
+| `ch_grid_mwh[t]` | Grid import |
+| `ch_from_gen_avail[t]` | BTM charging from exportable generation |
+| `ch_from_surplus_gen[t]` | BTM charging from clipped (surplus) generation |
+
+The individual split between `ch_from_gen_avail` and `ch_from_surplus_gen` is not tracked separately — only their combined BTM share matters for the SOC:
+
+```
+ch_btm[t]  =  ch_from_gen_avail[t] + ch_from_surplus_gen[t]
+           =  ch_mwh[t] − ch_grid_mwh[t]
+           ≤  gen_avail[t] + surplus_gen[t]
+           =  generation_mwh[t]
+```
+
+**C2 — Lifetime cycle cap** (optional; omit `max_cycles` to disable):
+
+```
+η_leg × Σ_t ch_mwh[t] ≤ max_cycles × capacity_mwh
+```
+
+### Co-location constraints
+
+#### Charging sources
+
+In co-location mode total charging `ch_mwh[t]` draws from three distinct sources:
+
+| Source | Definition | Exportable? | Tariff treatment |
+|--------|-----------|-------------|-----------------|
+| **Grid** | `ch_grid_mwh[t]` | — | `charge_tariff` on import + `discharge_tariff` on eventual export |
+| **Exportable BTM generation** | `gen_avail[t] = min(generation_mwh[t], export_connection_dt)` | Yes, but used for BTM charging instead | Both tariffs exempt; opportunity cost: foregone export revenue |
+| **Surplus (clipped) generation** | `surplus_gen[t] = max(0, generation_mwh[t] − export_connection_dt)` | No — exceeds export connection | Both tariffs exempt; no opportunity cost |
+
+The two BTM sources sum to total available generation:
+
+```
+gen_avail[t] + surplus_gen[t] = generation_mwh[t]
+```
+
+so the BTM-charged share is bounded by total generation:
+
+```
+ch_btm[t]  =  ch_mwh[t] − ch_grid_mwh[t]  ≤  generation_mwh[t]
+```
+
+**C3 — Export headroom** — generation occupies part of the export connection; the BESS can only use the remainder:
+
+```
+dsch_mwh[t] ≤ export_connection_dt − gen_avail[t]
+```
+
+where `export_connection_dt = grid_export_mw × dt` (or `power_mw × dt`), and  
+`gen_avail[t] = min(generation_mwh[t], export_connection_dt)`.
+
+**C4 — Lower bound on grid import** — forces `ch_grid_mwh > 0` only when total charging exceeds both BTM sources:
+
+```
+ch_grid_mwh[t] ≥ ch_mwh[t] − gen_avail[t] − surplus_gen[t]
+```
+
+Combined with B4 this pins `ch_grid_mwh[t] = max(0, ch_mwh[t] − gen_avail[t] − surplus_gen[t])`,  
+where `surplus_gen[t] = max(0, generation_mwh[t] − export_connection_dt)` is clipped generation  
+that cannot be exported and is free to charge the BESS.  
+Rearranged: BTM share `ch_mwh[t] − ch_grid_mwh[t] ≤ gen_avail[t] + surplus_gen[t]`.
+
+**C5 — Grid import ceiling**:
+
+```
+ch_grid_mwh[t] ≤ ch_mwh[t]
+```
+
+Prevents `ch_grid_mwh` from being inflated when `charge_tariff = 0` gives no cost signal.
+
+**C6 — Gen-avail BTM charging ceiling**:
+
+```
+ch_from_gen_avail[t] ≤ ch_mwh[t] − ch_grid_mwh[t]
+```
+
+Combined with B5 this pins `ch_from_gen_avail[t] = min(ch_btm[t], gen_avail[t])`. The optimizer
+drives it to this value naturally because `ch_from_gen_avail` earns a `discharge_tariff` refund in
+the objective.
+
+### Objective
+
+**O1 — Stand-alone** (maximise over all timesteps):
+
+```
+max  Σ_t [ price[t] × (dsch_mwh[t] − ch_mwh[t])
+         − discharge_tariff × dsch_mwh[t]
+         − charge_tariff    × ch_mwh[t] ]
+```
+
+**O2 — Co-location** (maximise over all timesteps):
+
+Total charging splits into two physically distinct streams:
+
+```
+ch_mwh[t]  =  ch_btm[t]  +  ch_grid_mwh[t]
+```
+
+where `ch_btm[t] = ch_mwh[t] − ch_grid_mwh[t]` is energy charged behind the meter from generation
+(never crossing the import meter, so exempt from both tariffs).
+
+**Full form** — all revenue and cost terms explicit:
+
+```
+max  Σ_t [   price[t]          × dsch_mwh[t]                  (1) spot revenue from discharge
+           − price[t]          × ch_btm[t]                     (2) spot cost of BTM charging
+           − price[t]          × ch_grid_mwh[t]                (3) spot cost of grid charging
+           − charge_tariff     × ch_grid_mwh[t]                (4) import tariff, grid share only
+           − discharge_tariff  × dsch_mwh[t]                   (5) export tariff on all discharge
+           + discharge_tariff  × ch_from_gen_avail[t]  ]       (6) export tariff refund, gen_avail share only
+```
+
+Terms (2)+(3) collapse to `− price[t] × ch_mwh[t]`.
+
+**Term (6) applies only to `ch_from_gen_avail`, not to all of `ch_btm`:**
+- `gen_avail` charging: BESS absorbs generation that *could* have been exported directly. Discharging it later creates no *new* net export — it merely shifts the timing. Discharge tariff refund is warranted.
+- `surplus_gen` charging: BESS absorbs clipped generation that *cannot* be exported. Discharging it later creates genuinely *new* export that crosses the meter. Discharge tariff applies.
+
+`charge_tariff` is replaced by `ctariff[t]` when a per-timestep consumption tariff series is supplied.
+
+**Coded form** (as implemented):
+
+```
+max  Σ_t [ price[t]         × (dsch_mwh[t] − ch_mwh[t])
+         − discharge_tariff × dsch_mwh[t]
+         + discharge_tariff × ch_from_gen_avail[t]
+         − charge_tariff    × ch_grid_mwh[t] ]
+```
+
+Verification:
+
+| Scenario | `ch_grid` | `ch_from_gen_avail` | Net tariff |
+|----------|-----------|---------------------|------------|
+| Fully BTM from gen_avail | 0 | `ch_mwh` | `discharge_tariff × (ch_mwh − dsch)` → 0 at perfect RTE ✓ |
+| Fully BTM from surplus_gen | 0 | 0 | `− discharge_tariff × dsch` (pays export tariff) ✓ |
+| Fully grid | `ch_mwh` | 0 | `− discharge_tariff × dsch − charge_tariff × ch_mwh` ✓ |
+

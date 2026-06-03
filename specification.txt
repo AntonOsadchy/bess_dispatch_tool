@@ -1,17 +1,18 @@
 # BESS dispatch — key = value (lines starting with # ignored)
 
-prices_csv = [inputs/Multiple inputs/prices_modified_DK1_1h_2025.csv, 
-inputs/Multiple inputs/prices_modified_DK1_1h_2026.csv,
-inputs/Multiple inputs/prices_modified_DK1_1h_2027.csv]
+prices_csv = [inputs/prices_spot_DK1_1h_2025.csv]
 
 output_csv = outputs/dispatch_results.csv
+# Optional: string appended to output filenames before the extension (e.g. _v2 → dispatch_results_v2.csv).
+# Omit or leave blank to use the default name.
+output_suffix = _co_located_no_grid
 # One price row = one hour (interval length is fixed in src/bess_dispatch_opt.py).
 
 # Rated AC power MW; max grid MWh per row = power * interval_hours (interval_hours is 1.0 in code).
-power = 50
+power = 1
 
 # Usable energy capacity MWh
-capacity_mwh = 100
+capacity_mwh = 2
 
 # Round-trip efficiency (0–1]: symmetric one-way efficiency is √(this). Stored MWh gained = grid_import_mwh × √η_rt; per grid MWh exported, stored drops by 1/√η_rt (so grid-to-grid round-trip = η_rt).
 round_trip_efficiency = 0.9
@@ -39,7 +40,7 @@ grid_import_mw = 0
 # In co-located mode generation already occupies part of this connection; BESS export is
 # limited to the remaining headroom: dsch_mwh[t] <= grid_export_mw - gen_avail[t].
 # If omitted, only the BESS rated power applies.
-grid_export_mw = 90
+grid_export_mw = 2
 
 
 # --- Co-location (optional) ---
@@ -51,7 +52,7 @@ grid_export_mw = 90
 # In co-location mode BESS discharge (grid export) is capped at generation_max_mw × capacity_factor
 # each timestep. Grid import for charging is unaffected.
 generation_profile_csv = inputs/solar_profile_Denmark_1h_2024.csv
-generation_max_mw = 116
+generation_max_mw = 2.5
 
 # Optional: max equivalent cycles: √(round_trip_efficiency) × sum(grid charge MWh) / capacity_mwh (stored charge / capacity).
 # Comment out or remove to disable.
