@@ -164,20 +164,22 @@ def load_prices_csv(path: Path) -> list[float]:
     return s.astype(float).tolist()
 
 
-def load_profile_csv(path: Path, max_mw: float) -> list[float]:
-    """Load a single-column, headerless capacity-factor profile and scale by max_mw.
+def load_profile_csv(path: Path, max_mw: float | None = None) -> list[float]:
+    """Load a single-column, headerless generation profile CSV.
 
-    The file must contain one numeric value per row representing a capacity factor [0–1]
-    (same layout as the prices CSV, e.g. solar_profile_Denmark_1h_2024.csv).
-    Values are clipped to [0, 1] before scaling.
-    Returns MWh per interval (= capacity_factor × max_mw × INTERVAL_HOURS).
+    When max_mw is provided the file is treated as capacity factors [0–1]:
+      values are clipped to [0, 1] and scaled → MWh per interval = cf × max_mw × INTERVAL_HOURS.
+    When max_mw is None the scaling step is skipped and each row is used directly as
+      MWh per interval (the CSV must already contain absolute energy values).
     """
     df = pd.read_csv(path, header=None)
     s = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
     if s.empty:
         sys.exit(f"No numeric values found in profile CSV: {path}")
-    cf = s.clip(0.0, 1.0).astype(float)
-    return (cf * max_mw * INTERVAL_HOURS).tolist()
+    if max_mw is not None:
+        cf = s.clip(0.0, 1.0).astype(float)
+        return (cf * max_mw * INTERVAL_HOURS).tolist()
+    return s.astype(float).tolist()
 
 
 def load_tariff_csv(path: Path) -> list[float]:
@@ -452,6 +454,7 @@ def write_output(
             row_generation_rev_curtailed    = 0.0 if curtailed else (p - discharge_tariff) * gen_mwh_t
             row_pv_net_export_mwh           = pv_net_export
             row_total_export_mwh            = pv_net_export + dsch_grid
+            row_bess_additional_export_mwh  = row_total_export_mwh - gen_gen_curtailed
         else:
             row_generation_mw               = 0.0
             row_charge_btm_mwh              = 0.0
@@ -463,6 +466,7 @@ def write_output(
             row_generation_rev_curtailed    = 0.0
             row_pv_net_export_mwh           = 0.0
             row_total_export_mwh            = dsch_grid
+            row_bess_additional_export_mwh  = dsch_grid
 
         row: dict = {
             "price": p,
@@ -486,6 +490,7 @@ def write_output(
             "generation_revenue_curtailed": row_generation_rev_curtailed,
             "pv_net_export_mwh": row_pv_net_export_mwh,
             "total_export_mwh": row_total_export_mwh,
+            "bess_additional_export_mwh": row_bess_additional_export_mwh,
         }
         rows.append(row)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -565,19 +570,17 @@ def main() -> None:
     consumption_tariffs: list[float] | None = None
 
     # Co-location: enabled by uncommenting generation_profile_csv in the spec.
-    # generation_max_mw must also be set when the profile is active.
+    # generation_max_mw is optional: when set the profile is treated as capacity factors
+    # [0–1] and scaled accordingly; when omitted the CSV values are used as-is (MWh/interval).
     gen_profile_csv = spec.get("generation_profile_csv", "").strip()
+    gen_max_mw: float | None = None
     generation_mwh: list[float] | None = None
     if gen_profile_csv:
         gen_max_mw_raw = spec.get("generation_max_mw", "").strip()
-        if not gen_max_mw_raw:
-            sys.exit(
-                "generation_profile_csv is set but generation_max_mw is missing. "
-                "Add generation_max_mw to the spec."
-            )
-        gen_max_mw = float(gen_max_mw_raw)
-        if gen_max_mw <= 0:
-            sys.exit("generation_max_mw must be positive")
+        if gen_max_mw_raw:
+            gen_max_mw = float(gen_max_mw_raw)
+            if gen_max_mw <= 0:
+                sys.exit("generation_max_mw must be positive")
         generation_mwh = load_profile_csv(Path(gen_profile_csv), gen_max_mw)
 
     # Surplus generation: clipped portion that cannot be exported (free BTM charging for BESS).
@@ -664,6 +667,8 @@ def main() -> None:
         total_dsch_profit   = 0.0   # spot revenue minus net discharge tariff (with BTM refund)
         spot_gross          = 0.0
         tariff_component    = 0.0
+        total_hybrid_export_mwh     = 0.0  # sum of (pv_net_export + dsch) = sum of total_export_mwh CSV col
+        total_hybrid_export_revenue = 0.0  # price-weighted revenue for total_hybrid_export_mwh
 
         for t in range(Tn):
             p        = prices[t]
@@ -675,10 +680,16 @@ def main() -> None:
                 ch_grid              = pyo.value(model.ch_grid_mwh[t])
                 ch_btm               = ch_total - ch_grid
                 ch_from_gen_avail_t  = pyo.value(model.ch_from_gen_avail[t])
+                gen_curtailed_t      = 0.0 if p <= discharge_tariff else generation_mwh[t]
+                pv_net_export_t      = max(0.0, gen_curtailed_t - ch_btm)
+                total_hybrid_export_mwh     += pv_net_export_t + dsch
+                total_hybrid_export_revenue += p * (pv_net_export_t + dsch)
             else:
                 ch_grid              = ch_total
                 ch_btm               = 0.0
                 ch_from_gen_avail_t  = 0.0
+                total_hybrid_export_mwh     += dsch
+                total_hybrid_export_revenue += p * dsch
 
             total_export_mwh     += dsch
             total_export_revenue += p * dsch
@@ -789,13 +800,17 @@ def main() -> None:
             gen_total = sum(generation_mwh)
             gen_peak  = max(generation_mwh)
             gen_hours = sum(1 for g in generation_mwh if g > 0)
-            capacity_factor = gen_total / (gen_max_mw * len(generation_mwh))
             report_lines.append(f"  Generation profile CSV               : {gen_profile_csv}")
-            report_lines.append(f"  Generation nameplate capacity        : {gen_max_mw:>10.2f} MW")
+            if gen_max_mw is not None:
+                capacity_factor = gen_total / (gen_max_mw * len(generation_mwh))
+                report_lines.append(f"  Generation nameplate capacity        : {gen_max_mw:>10.2f} MW")
+                report_lines.append(f"  Capacity factor                      : {capacity_factor*100:>10.1f} %")
+            else:
+                report_lines.append(f"  Generation nameplate capacity        : {'N/A (not set)':>10}")
+                report_lines.append(f"  Capacity factor                      : {'N/A (not set)':>10}")
             report_lines.append(f"  Annual generation                    : {gen_total:>10.2f} MWh")
             report_lines.append(f"  Peak output                          : {gen_peak:>10.2f} MW")
             report_lines.append(f"  Generating hours                     : {gen_hours:>10d} h")
-            report_lines.append(f"  Capacity factor                      : {capacity_factor*100:>10.1f} %")
         else:
             report_lines.append("  Generation profile CSV               :   disabled")
             report_lines.append(f"  Generation nameplate capacity        : {0.0:>10.2f} MW")
@@ -849,22 +864,24 @@ def main() -> None:
                     rev_curtailed += (p - discharge_tariff) * gen_mwh_t
             capture_price_uncurtailed = rev_uncurtailed / vol_uncurtailed if vol_uncurtailed > 1e-12 else float("nan")
             capture_price_curtailed   = rev_curtailed / vol_curtailed if vol_curtailed > 1e-12 else float("nan")
-            combined_export_mwh     = total_export_mwh + vol_curtailed
-            combined_export_revenue = total_export_revenue + rev_curtailed
-            combined_avg_export_price = combined_export_revenue / combined_export_mwh if combined_export_mwh > 1e-12 else float("nan")
-        else:
+        if generation_mwh is None:
             vol_uncurtailed = rev_uncurtailed = vol_curtailed = rev_curtailed = 0.0
             capture_price_uncurtailed = capture_price_curtailed = float("nan")
-            combined_export_mwh     = total_export_mwh
-            combined_export_revenue = total_export_revenue
-            combined_avg_export_price = weighted_avg_export_price
+
+        combined_avg_export_price = (
+            total_hybrid_export_revenue / total_hybrid_export_mwh
+            if total_hybrid_export_mwh > 1e-12 else float("nan")
+        )
+
+        bess_additional_export_mwh = total_hybrid_export_mwh - vol_curtailed
 
         report_lines.append("")
         report_lines.append("--- Combined System (BESS + Generation) ---")
         report_lines.append(f"  {'Source':<36} : {'Volume (MWh)':>12} | {'Avg price (€/MWh)':>17}")
         report_lines.append(f"  {'Direct generation export (curtailed)':<36} : {vol_curtailed:>12.2f} | {capture_price_curtailed:>17.2f}")
         report_lines.append(f"  {'BESS export':<36} : {total_export_mwh:>12.2f} | {weighted_avg_export_price:>17.2f}")
-        report_lines.append(f"  {'Combined':<36} : {combined_export_mwh:>12.2f} | {combined_avg_export_price:>17.2f}")
+        report_lines.append(f"  {'BESS additional exports (delta)':<36} : {bess_additional_export_mwh:>12.2f} | {weighted_avg_export_price:>17.2f}")
+        report_lines.append(f"  {'Combined':<36} : {total_hybrid_export_mwh:>12.2f} | {combined_avg_export_price:>17.2f}")
 
         report_lines.append("")
         report_lines.append("--- Generation Revenue Report ---")
@@ -911,10 +928,9 @@ def main() -> None:
             else:
                 report_rows.append((line, None, None))
 
-        # Excel sheet names are capped at 31 chars; derive prefix from prices filename stem + suffix.
-        _prefix = (prices_path.stem + output_suffix)[:22]  # leave room for " Dispatch" (9 chars)
-        sheet_dispatch = _prefix + " Dispatch"
-        sheet_results  = _prefix + " Results"
+        # Excel sheet names are capped at 31 chars.
+        sheet_dispatch = ("Dispatch" + output_suffix)[:31]
+        sheet_results  = ("Results"  + output_suffix)[:31]
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
             pd.read_csv(output_path).to_excel(writer, sheet_name=sheet_dispatch, index=False)
             pd.DataFrame(report_rows, columns=["Label", "Value", "Value2"]).to_excel(
