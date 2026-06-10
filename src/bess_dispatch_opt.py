@@ -395,6 +395,7 @@ def write_output(
     round_trip_efficiency: float,
     charge_tariff: float,
     discharge_tariff: float,
+    curtailment_threshold: float,
     generation_mwh: list[float] | None = None,
     consumption_tariffs: list[float] | None = None,
     surplus_generation_mwh: list[float] | None = None,
@@ -440,7 +441,7 @@ def write_output(
         # Co-location columns — computed for all rows; zero-filled when feature is disabled.
         if generation_mwh is not None:
             gen_mwh_t = generation_mwh[t]
-            threshold = discharge_tariff
+            threshold = curtailment_threshold
             curtailed = p <= threshold
             gen_gen_curtailed = 0.0 if curtailed else gen_mwh_t
             pv_net_export = max(0.0, gen_gen_curtailed - ch_btm)
@@ -551,6 +552,8 @@ def main() -> None:
     rte = spec_float(spec, "round_trip_efficiency")
     charge_tariff = spec_float(spec, "charge_tariff", default=0.0)
     discharge_tariff = spec_float(spec, "discharge_tariff", default=0.0)
+    curtailment_price_raw = spec_float(spec, "curtailment_price", default=None)
+    curtailment_threshold = curtailment_price_raw if curtailment_price_raw is not None else discharge_tariff
     max_cycles = spec_optional_float(spec, "max_cycles")
     capacity_mwh = spec_float(spec, "capacity_mwh")
 
@@ -680,7 +683,7 @@ def main() -> None:
                 ch_grid              = pyo.value(model.ch_grid_mwh[t])
                 ch_btm               = ch_total - ch_grid
                 ch_from_gen_avail_t  = pyo.value(model.ch_from_gen_avail[t])
-                gen_curtailed_t      = 0.0 if p <= discharge_tariff else generation_mwh[t]
+                gen_curtailed_t      = 0.0 if p <= curtailment_threshold else generation_mwh[t]
                 pv_net_export_t      = max(0.0, gen_curtailed_t - ch_btm)
                 total_hybrid_export_mwh     += pv_net_export_t + dsch
                 total_hybrid_export_revenue += p * (pv_net_export_t + dsch)
@@ -762,6 +765,7 @@ def main() -> None:
             round_trip_efficiency=rte,
             charge_tariff=charge_tariff,
             discharge_tariff=discharge_tariff,
+            curtailment_threshold=curtailment_threshold,
             generation_mwh=generation_mwh,
             consumption_tariffs=consumption_tariffs,
             surplus_generation_mwh=surplus_generation_mwh,
@@ -859,7 +863,7 @@ def main() -> None:
                 p = prices[t]
                 vol_uncurtailed += gen_mwh_t
                 rev_uncurtailed += (p - discharge_tariff) * gen_mwh_t
-                if p > discharge_tariff:
+                if p > curtailment_threshold:
                     vol_curtailed += gen_mwh_t
                     rev_curtailed += (p - discharge_tariff) * gen_mwh_t
             capture_price_uncurtailed = rev_uncurtailed / vol_uncurtailed if vol_uncurtailed > 1e-12 else float("nan")
@@ -890,7 +894,7 @@ def main() -> None:
         report_lines.append(f"  Total revenue                        : {rev_uncurtailed:>10.2f} €")
         report_lines.append(f"  Capture price                        : {0.0 if math.isnan(capture_price_uncurtailed) else capture_price_uncurtailed:>10.2f} €/MWh")
         report_lines.append("")
-        report_lines.append("Curtailed (no production when price ≤ tariff):")
+        report_lines.append(f"Curtailed (no production when price ≤ {curtailment_threshold:.4g} €/MWh):")
         report_lines.append(f"  Generation volume                    : {vol_curtailed:>10.2f} MWh")
         report_lines.append(f"  Total revenue                        : {rev_curtailed:>10.2f} €")
         report_lines.append(f"  Capture price                        : {0.0 if math.isnan(capture_price_curtailed) else capture_price_curtailed:>10.2f} €/MWh")

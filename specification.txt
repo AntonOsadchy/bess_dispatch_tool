@@ -21,6 +21,11 @@ round_trip_efficiency = 0.9
 #charge_tariff = 0
 discharge_tariff = 1.38
 
+# Optional: price threshold below which co-located generation is curtailed (€/MWh, same units as prices).
+# When commented out, defaults to discharge_tariff above.
+# Set explicitly to decouple curtailment reporting from the export tariff.
+#curtailment_price = 0.00
+
 # Optional: per-timestep consumption tariff time-series (€/MWh).
 # Single-column, headerless CSV — one value per timestep, same layout as prices_csv.
 # When set, this series overrides the scalar charge_tariff above for every timestep.
