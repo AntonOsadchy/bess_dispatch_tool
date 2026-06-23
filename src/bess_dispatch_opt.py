@@ -198,6 +198,33 @@ def load_tariff_csv(path: Path) -> list[float]:
     return s.astype(float).tolist()
 
 
+def load_existing_profile_csv(path: Path) -> tuple[list[float], list[float]]:
+    """Load a pre-committed dispatch profile from a named-column CSV.
+
+    Expected columns: 'charge_mwh' (stored-side charging MWh per timestep) and
+    'discharge_mwh' (stored-side discharging MWh per timestep) — matching the
+    column names in this tool's own output CSV, so users can reference a prior
+    run's output file directly.
+
+    Returns (profile_ch_stored, profile_dsch_stored), both in stored-side MWh.
+    """
+    df = pd.read_csv(path)
+    for col in ("charge_mwh", "discharge_mwh"):
+        if col not in df.columns:
+            sys.exit(
+                f"Existing dispatch profile CSV '{path}' is missing required column '{col}'. "
+                "Expected columns: charge_mwh, discharge_mwh"
+            )
+    ch = pd.to_numeric(df["charge_mwh"], errors="coerce").fillna(0.0).tolist()
+    dsch = pd.to_numeric(df["discharge_mwh"], errors="coerce").fillna(0.0).tolist()
+    if any(v < 0 for v in ch) or any(v < 0 for v in dsch):
+        sys.exit(
+            f"Existing dispatch profile CSV '{path}' contains negative values. "
+            "All charge_mwh and discharge_mwh values must be >= 0."
+        )
+    return ch, dsch
+
+
 def build_and_solve(
     prices: list[float],
     *,
@@ -211,6 +238,7 @@ def build_and_solve(
     grid_import_mw: float | None = None,
     grid_export_mw: float | None = None,
     consumption_tariffs: list[float] | None = None,
+    existing_dispatch_stored: tuple[list[float], list[float]] | None = None,
 ) -> tuple[pyo.ConcreteModel, pyo.SolverResults]:
     rte = round_trip_efficiency
     if not (0 < rte <= 1):
@@ -231,6 +259,13 @@ def build_and_solve(
             sys.exit(
                 f"Consumption tariff series length ({len(consumption_tariffs)}) does not match "
                 f"price series length ({T}). Align the two CSVs to the same period."
+            )
+
+    if existing_dispatch_stored is not None:
+        if len(existing_dispatch_stored[0]) != T:
+            sys.exit(
+                f"Existing dispatch profile length ({len(existing_dispatch_stored[0])}) does not match "
+                f"price series length ({T}). Align the profile CSV to the same period."
             )
 
     eta_leg = math.sqrt(rte)
@@ -286,6 +321,22 @@ def build_and_solve(
 
     m.soc_cons = pyo.Constraint(m.T, rule=soc_rule)  # [C1]
 
+    # Profile lower-bound constraints: force total dispatch to honour the committed profile.
+    # The existing ch_mwh/dsch_mwh variables represent combined (profile + additional) dispatch.
+    # The optimizer naturally maximises the additional component since the profile floor is fixed.
+    if existing_dispatch_stored is not None:
+        prof_ch_list, prof_dsch_list = existing_dispatch_stored
+        prof_ch_ac   = {t: prof_ch_list[t]   / eta_leg for t in times}
+        prof_dsch_ac = {t: prof_dsch_list[t] * eta_leg for t in times}
+        m.profile_ch_param   = pyo.Param(m.T, initialize=prof_ch_ac)
+        m.profile_dsch_param = pyo.Param(m.T, initialize=prof_dsch_ac)
+        m.profile_ch_lb = pyo.Constraint(
+            m.T, rule=lambda mm, t: mm.ch_mwh[t] >= mm.profile_ch_param[t]
+        )
+        m.profile_dsch_lb = pyo.Constraint(
+            m.T, rule=lambda mm, t: mm.dsch_mwh[t] >= mm.profile_dsch_param[t]
+        )
+
     if max_cycles is not None:
 
         def cycle_cap_rule(mm):
@@ -308,6 +359,17 @@ def build_and_solve(
         # surplus_gen[t] = max(0, generation_mwh[t] − export_connection_dt)
         surplus_param = {t: max(0.0, generation_mwh[t] - export_connection_dt) for t in times}
         m.surplus_gen = pyo.Param(m.T, initialize=surplus_param)
+
+        # Guard: profile discharge must not exceed the export headroom available after generation.
+        if existing_dispatch_stored is not None:
+            for t in times:
+                prof_dsch_ac_t = existing_dispatch_stored[1][t] * eta_leg
+                headroom = export_connection_dt - gen_param[t]
+                if prof_dsch_ac_t > headroom + 1e-4:
+                    sys.exit(
+                        f"Existing dispatch profile discharge at t={t} ({prof_dsch_ac_t:.4f} MWh) "
+                        f"exceeds co-location export headroom ({headroom:.4f} MWh). Profile is infeasible."
+                    )
 
         def colocation_rule(mm, t):
             return mm.dsch_mwh[t] <= export_connection_dt - mm.gen_avail[t]
@@ -399,6 +461,7 @@ def write_output(
     generation_mwh: list[float] | None = None,
     consumption_tariffs: list[float] | None = None,
     surplus_generation_mwh: list[float] | None = None,
+    existing_dispatch_stored: tuple[list[float], list[float]] | None = None,
 ) -> None:
     eta_leg = math.sqrt(round_trip_efficiency)
     rows = []
@@ -492,6 +555,10 @@ def write_output(
             "pv_net_export_mwh": row_pv_net_export_mwh,
             "total_export_mwh": row_total_export_mwh,
             "bess_additional_export_mwh": row_bess_additional_export_mwh,
+            # Profile columns: stored-side committed dispatch from existing_dispatch_profile_csv.
+            # charge_mwh/discharge_mwh above show combined totals (profile + additional).
+            "profile_charge_mwh": existing_dispatch_stored[0][t] if existing_dispatch_stored is not None else 0.0,
+            "profile_discharge_mwh": existing_dispatch_stored[1][t] if existing_dispatch_stored is not None else 0.0,
         }
         rows.append(row)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -612,6 +679,11 @@ def main() -> None:
     if consumption_tariff_csv is not None:
         consumption_tariffs = load_tariff_csv(Path(consumption_tariff_csv))
 
+    existing_dispatch_profile_csv = spec_optional_str(spec, "existing_dispatch_profile_csv")
+    existing_dispatch_stored: tuple[list[float], list[float]] | None = None
+    if existing_dispatch_profile_csv is not None:
+        existing_dispatch_stored = load_existing_profile_csv(Path(existing_dispatch_profile_csv))
+
     for i, prices_path_str in enumerate(prices_paths_raw):
         prices_path = Path(prices_path_str)
 
@@ -647,6 +719,7 @@ def main() -> None:
             grid_import_mw=grid_import_mw,
             grid_export_mw=grid_export_mw,
             consumption_tariffs=consumption_tariffs,
+            existing_dispatch_stored=existing_dispatch_stored,
         )
 
         ok = (
@@ -769,6 +842,7 @@ def main() -> None:
             generation_mwh=generation_mwh,
             consumption_tariffs=consumption_tariffs,
             surplus_generation_mwh=surplus_generation_mwh,
+            existing_dispatch_stored=existing_dispatch_stored,
         )
 
         # -------------------------------------------------------------------------
@@ -899,6 +973,20 @@ def main() -> None:
         report_lines.append(f"  Total revenue                        : {rev_curtailed:>10.2f} €")
         report_lines.append(f"  Capture price                        : {0.0 if math.isnan(capture_price_curtailed) else capture_price_curtailed:>10.2f} €/MWh")
 
+        if existing_dispatch_stored is not None:
+            prof_ch_vol      = sum(existing_dispatch_stored[0])
+            prof_dsch_vol    = sum(existing_dispatch_stored[1])
+            eta_leg_rep      = math.sqrt(rte)
+            prof_ch_vol_ac   = sum(v / eta_leg_rep for v in existing_dispatch_stored[0])
+            prof_dsch_vol_ac = sum(v * eta_leg_rep for v in existing_dispatch_stored[1])
+            report_lines.append("")
+            report_lines.append("--- Existing Dispatch Profile ---")
+            report_lines.append(f"  Profile CSV                          : {existing_dispatch_profile_csv}")
+            report_lines.append(f"  Profile charging volume (stored)     : {prof_ch_vol:>10.2f} MWh")
+            report_lines.append(f"  Profile discharging volume (stored)  : {prof_dsch_vol:>10.2f} MWh")
+            report_lines.append(f"  Profile AC charging volume           : {prof_ch_vol_ac:>10.2f} MWh")
+            report_lines.append(f"  Profile AC discharging volume        : {prof_dsch_vol_ac:>10.2f} MWh")
+
         # Print to terminal
         print()
         for line in report_lines:
@@ -931,6 +1019,22 @@ def main() -> None:
                     report_rows.append((label.rstrip(), _try_numeric(rest), None))
             else:
                 report_rows.append((line, None, None))
+
+        # Append renewable generation curtailment block at the bottom of the Results sheet only
+        # (not written to terminal or .txt to avoid breaking existing row mapping).
+        if generation_mwh is not None:
+            curtailed_volume_mwh = vol_uncurtailed - vol_curtailed
+            curtailment_rate = (
+                curtailed_volume_mwh / vol_uncurtailed * 100
+                if vol_uncurtailed > 1e-12 else 0.0
+            )
+            report_rows.append(("", None, None))
+            report_rows.append(("--- Renewable Generation Curtailment ---", None, None))
+            report_rows.append((f"  Curtailment price threshold", curtailment_threshold, None))
+            report_rows.append(("  Total generation volume (MWh)", round(vol_uncurtailed, 2), None))
+            report_rows.append(("  Dispatched volume (price > threshold) (MWh)", round(vol_curtailed, 2), None))
+            report_rows.append(("  Curtailed volume (price <= threshold) (MWh)", round(curtailed_volume_mwh, 2), None))
+            report_rows.append(("  Curtailment rate (%)", round(curtailment_rate, 2), None))
 
         # Excel sheet names are capped at 31 chars.
         sheet_dispatch = ("Dispatch" + output_suffix)[:31]
