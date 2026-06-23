@@ -1020,6 +1020,22 @@ def main() -> None:
             else:
                 report_rows.append((line, None, None))
 
+        # Append renewable generation curtailment block at the bottom of the Results sheet only
+        # (not written to terminal or .txt to avoid breaking existing row mapping).
+        if generation_mwh is not None:
+            curtailed_volume_mwh = vol_uncurtailed - vol_curtailed
+            curtailment_rate = (
+                curtailed_volume_mwh / vol_uncurtailed * 100
+                if vol_uncurtailed > 1e-12 else 0.0
+            )
+            report_rows.append(("", None, None))
+            report_rows.append(("--- Renewable Generation Curtailment ---", None, None))
+            report_rows.append((f"  Curtailment price threshold", curtailment_threshold, None))
+            report_rows.append(("  Total generation volume (MWh)", round(vol_uncurtailed, 2), None))
+            report_rows.append(("  Dispatched volume (price > threshold) (MWh)", round(vol_curtailed, 2), None))
+            report_rows.append(("  Curtailed volume (price <= threshold) (MWh)", round(curtailed_volume_mwh, 2), None))
+            report_rows.append(("  Curtailment rate (%)", round(curtailment_rate, 2), None))
+
         # Excel sheet names are capped at 31 chars.
         sheet_dispatch = ("Dispatch" + output_suffix)[:31]
         sheet_results  = ("Results"  + output_suffix)[:31]
