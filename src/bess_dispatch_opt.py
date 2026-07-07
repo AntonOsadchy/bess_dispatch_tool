@@ -743,8 +743,7 @@ def main() -> None:
         total_dsch_profit   = 0.0   # spot revenue minus net discharge tariff (with BTM refund)
         spot_gross          = 0.0
         tariff_component    = 0.0
-        total_hybrid_export_mwh     = 0.0  # sum of (pv_net_export + dsch) = sum of total_export_mwh CSV col
-        total_hybrid_export_revenue = 0.0  # price-weighted revenue for total_hybrid_export_mwh
+        curtailment_reduction_charge = 0.0  # BTM charge attributable to curtailment (pre-efficiency)
 
         for t in range(Tn):
             p        = prices[t]
@@ -756,16 +755,18 @@ def main() -> None:
                 ch_grid              = pyo.value(model.ch_grid_mwh[t])
                 ch_btm               = ch_total - ch_grid
                 ch_from_gen_avail_t  = pyo.value(model.ch_from_gen_avail[t])
-                gen_curtailed_t      = 0.0 if p <= curtailment_threshold else generation_mwh[t]
-                pv_net_export_t      = max(0.0, gen_curtailed_t - ch_btm)
-                total_hybrid_export_mwh     += pv_net_export_t + dsch
-                total_hybrid_export_revenue += p * (pv_net_export_t + dsch)
+                # Curtailment-reduction charge: all BTM charge during a price-curtailed hour
+                # (the whole hour's generation would otherwise be wasted), or just the
+                # surplus-sourced share during a non-curtailed hour (only the portion beyond
+                # the grid connection would otherwise be wasted).
+                if p <= curtailment_threshold:
+                    curtailment_reduction_charge += ch_btm
+                else:
+                    curtailment_reduction_charge += min(ch_btm, surplus_generation_mwh[t])
             else:
                 ch_grid              = ch_total
                 ch_btm               = 0.0
                 ch_from_gen_avail_t  = 0.0
-                total_hybrid_export_mwh     += dsch
-                total_hybrid_export_revenue += p * dsch
 
             total_export_mwh     += dsch
             total_export_revenue += p * dsch
@@ -787,9 +788,10 @@ def main() -> None:
             else:
                 tariff_component += eff_ct * ch_total + discharge_tariff * dsch
 
-        weighted_avg_export_price = (
-            total_export_revenue / total_export_mwh if total_export_mwh > 1e-12 else float("nan")
-        )
+        # Curtailment reduction: BTM charge attributable to curtailment, converted to expected
+        # re-exported volume via round-trip efficiency.
+        curtailment_reduction_mwh = rte * curtailment_reduction_charge
+
         weighted_avg_charge_cost = (
             total_charge_cost / total_charge_mwh if total_charge_mwh > 1e-12 else float("nan")
         )
@@ -925,6 +927,7 @@ def main() -> None:
             report_lines.append(f"  Profit per cycle per MW              : {profit_per_cycle / power_mw:>10.2f} €/cycle/MW")
         report_lines.append(f"  Profit / 365 cycles (normalised)     : {profit_365_cycles_normalized:>10.2f} €/cycle")
         report_lines.append(f"  Profit / 365 cycles per MW           : {profit_365_cycles_normalized / power_mw:>10.2f} €/cycle/MW")
+        report_lines.append(f"  BESS curtailment reduction           : {curtailment_reduction_mwh:>10.2f} MWh")
         report_lines.append(f"  BESS charged from surplus generation : {total_surplus_charged_mwh if total_surplus_charged_mwh is not None else 0.0:>10.2f} MWh")
 
         # Combined system (BESS + generation).
@@ -946,46 +949,14 @@ def main() -> None:
             vol_uncurtailed = rev_uncurtailed = vol_curtailed = rev_curtailed = 0.0
             capture_price_uncurtailed = capture_price_curtailed = float("nan")
 
-        combined_avg_export_price = (
-            total_hybrid_export_revenue / total_hybrid_export_mwh
-            if total_hybrid_export_mwh > 1e-12 else float("nan")
-        )
-
-        bess_additional_export_mwh = total_hybrid_export_mwh - vol_curtailed
-
-        report_lines.append("")
-        report_lines.append("--- Combined System (BESS + Generation) ---")
-        report_lines.append(f"  {'Source':<36} : {'Volume (MWh)':>12} | {'Avg price (€/MWh)':>17}")
-        report_lines.append(f"  {'Direct generation export (curtailed)':<36} : {vol_curtailed:>12.2f} | {capture_price_curtailed:>17.2f}")
-        report_lines.append(f"  {'BESS export':<36} : {total_export_mwh:>12.2f} | {weighted_avg_export_price:>17.2f}")
-        report_lines.append(f"  {'BESS additional exports (delta)':<36} : {bess_additional_export_mwh:>12.2f} | {weighted_avg_export_price:>17.2f}")
-        report_lines.append(f"  {'Combined':<36} : {total_hybrid_export_mwh:>12.2f} | {combined_avg_export_price:>17.2f}")
-
-        report_lines.append("")
-        report_lines.append("--- Generation Revenue Report ---")
-        report_lines.append("Uncurtailed (production at all prices, including negative):")
-        report_lines.append(f"  Generation volume                    : {vol_uncurtailed:>10.2f} MWh")
-        report_lines.append(f"  Total revenue                        : {rev_uncurtailed:>10.2f} €")
-        report_lines.append(f"  Capture price                        : {0.0 if math.isnan(capture_price_uncurtailed) else capture_price_uncurtailed:>10.2f} €/MWh")
-        report_lines.append("")
-        report_lines.append(f"Curtailed (no production when price ≤ {curtailment_threshold:.4g} €/MWh):")
-        report_lines.append(f"  Generation volume                    : {vol_curtailed:>10.2f} MWh")
-        report_lines.append(f"  Total revenue                        : {rev_curtailed:>10.2f} €")
-        report_lines.append(f"  Capture price                        : {0.0 if math.isnan(capture_price_curtailed) else capture_price_curtailed:>10.2f} €/MWh")
-
-        if existing_dispatch_stored is not None:
-            prof_ch_vol      = sum(existing_dispatch_stored[0])
-            prof_dsch_vol    = sum(existing_dispatch_stored[1])
-            eta_leg_rep      = math.sqrt(rte)
-            prof_ch_vol_ac   = sum(v / eta_leg_rep for v in existing_dispatch_stored[0])
-            prof_dsch_vol_ac = sum(v * eta_leg_rep for v in existing_dispatch_stored[1])
+        if generation_mwh is not None:
             report_lines.append("")
-            report_lines.append("--- Existing Dispatch Profile ---")
-            report_lines.append(f"  Profile CSV                          : {existing_dispatch_profile_csv}")
-            report_lines.append(f"  Profile charging volume (stored)     : {prof_ch_vol:>10.2f} MWh")
-            report_lines.append(f"  Profile discharging volume (stored)  : {prof_dsch_vol:>10.2f} MWh")
-            report_lines.append(f"  Profile AC charging volume           : {prof_ch_vol_ac:>10.2f} MWh")
-            report_lines.append(f"  Profile AC discharging volume        : {prof_dsch_vol_ac:>10.2f} MWh")
+            report_lines.append("--- Renewable Generation Summary ---")
+            report_lines.append(f"  Total uncurtailed generation (MWh)         : {vol_uncurtailed:>10.2f}")
+            report_lines.append(f"  Total curtailed generation (MWh)           : {vol_curtailed:>10.2f}")
+            report_lines.append(f"  Curtailment volume (MWh)                   : {vol_uncurtailed - vol_curtailed:>10.2f}")
+            report_lines.append(f"  Weighted avg price, curtailed gen (€/MWh)  : {0.0 if math.isnan(capture_price_curtailed) else capture_price_curtailed:>10.2f}")
+            report_lines.append(f"  Weighted avg price, uncurtailed gen (€/MWh) : {0.0 if math.isnan(capture_price_uncurtailed) else capture_price_uncurtailed:>10.2f}")
 
         # Print to terminal
         print()
@@ -1020,22 +991,6 @@ def main() -> None:
             else:
                 report_rows.append((line, None, None))
 
-        # Append renewable generation curtailment block at the bottom of the Results sheet only
-        # (not written to terminal or .txt to avoid breaking existing row mapping).
-        if generation_mwh is not None:
-            curtailed_volume_mwh = vol_uncurtailed - vol_curtailed
-            curtailment_rate = (
-                curtailed_volume_mwh / vol_uncurtailed * 100
-                if vol_uncurtailed > 1e-12 else 0.0
-            )
-            report_rows.append(("", None, None))
-            report_rows.append(("--- Renewable Generation Curtailment ---", None, None))
-            report_rows.append((f"  Curtailment price threshold", curtailment_threshold, None))
-            report_rows.append(("  Total generation volume (MWh)", round(vol_uncurtailed, 2), None))
-            report_rows.append(("  Dispatched volume (price > threshold) (MWh)", round(vol_curtailed, 2), None))
-            report_rows.append(("  Curtailed volume (price <= threshold) (MWh)", round(curtailed_volume_mwh, 2), None))
-            report_rows.append(("  Curtailment rate (%)", round(curtailment_rate, 2), None))
-
         # Excel sheet names are capped at 31 chars.
         sheet_dispatch = ("Dispatch" + output_suffix)[:31]
         sheet_results  = ("Results"  + output_suffix)[:31]
@@ -1044,6 +999,15 @@ def main() -> None:
             pd.DataFrame(report_rows, columns=["Label", "Value", "Value2"]).to_excel(
                 writer, sheet_name=sheet_results, index=False, header=False
             )
+
+            # Column A (Label) width, column B (Value) width and Excel's built-in "Comma [0]" style.
+            results_ws = writer.sheets[sheet_results]
+            results_ws.column_dimensions["A"].width = 45
+            results_ws.column_dimensions["B"].width = 30
+            comma_format = '_-* #,##0_-;-* #,##0_-;_-* "-"_-;_-@_-'
+            for row in results_ws.iter_rows(min_col=2, max_col=2):
+                for cell in row:
+                    cell.number_format = comma_format
 
         print(f"\nWrote {output_path.resolve()}")
         print(f"Wrote {report_path.resolve()}")

@@ -38,7 +38,7 @@ consumption_tariff_csv = inputs/tariffs_consumption_energinet_DK2_1h_2026.csv
 # up to gen_avail[t]; grid import adds on top of that, capped here. Total charging is still
 # bounded by the BESS rated power (power = above).
 # If omitted, only the BESS rated power applies.
-grid_import_mw = 50
+grid_import_mw = 0
 
 # Optional: grid connection export capacity in MW.
 # Limits how much the BESS can discharge to the grid each timestep.

@@ -11,7 +11,7 @@
   BESS power                           :      50.00 MW
   BESS capacity                        :     100.00 MWh
   Round-trip efficiency                :       90.0 %
-  Grid import cap                      :      50.00 MW
+  Grid import cap                      :       0.00 MW
   Grid export cap                      :      90.00 MW
   Max cycles                           :  unlimited
 
@@ -23,42 +23,25 @@
   Generating hours                     :       4371 h
 
 --- BESS Results ---
-  Spot revenue (gross, before tariffs) : 3303407.48 €
-  Tariff charges                       :  349987.51 €
-  Total profit                         : 2953419.97 €
-  Charging volume                      :   62121.52 MWh
-  Weighted avg charging cost           :      61.08 €/MWh
-  Discharging volume                   :   55956.80 MWh
-  Weighted avg discharge profit        :     120.59 €/MWh
-  Vol × avg price cross-check          : 2953419.97 €
-  Equivalent full cycles               :     589.34 cycles
-  Profit per cycle                     :    5011.43 €/cycle
-  Profit per cycle per MW              :     100.23 €/cycle/MW
-  Profit / 365 cycles (normalised)     :    8091.56 €/cycle
-  Profit / 365 cycles per MW           :     161.83 €/cycle/MW
+  Spot revenue (gross, before tariffs) : 2136964.37 €
+  Tariff charges                       :   -4450.97 €
+  Total profit                         : 2141415.35 €
+  Charging volume                      :   32727.77 MWh
+  Weighted avg charging cost           :      51.41 €/MWh
+  Discharging volume                   :   29502.43 MWh
+  Weighted avg discharge profit        :     129.61 €/MWh
+  Vol × avg price cross-check          : 2141415.35 €
+  Equivalent full cycles               :     310.48 cycles
+  Profit per cycle                     :    6897.05 €/cycle
+  Profit per cycle per MW              :     137.94 €/cycle/MW
+  Profit / 365 cycles (normalised)     :    5866.89 €/cycle
+  Profit / 365 cycles per MW           :     117.34 €/cycle/MW
+  BESS curtailment reduction           :    3993.76 MWh
   BESS charged from surplus generation :     337.26 MWh
 
---- Combined System (BESS + Generation) ---
-  Source                               : Volume (MWh) | Avg price (€/MWh)
-  Direct generation export (curtailed) :    124663.70 |             69.44
-  BESS export                          :     55956.80 |            121.16
-  BESS additional exports (delta)      :     27417.93 |            121.16
-  Combined                             :    152081.64 |             91.45
-
---- Generation Revenue Report ---
-Uncurtailed (production at all prices, including negative):
-  Generation volume                    :  132101.72 MWh
-  Total revenue                        : 8615189.76 €
-  Capture price                        :      65.22 €/MWh
-
-Curtailed (no production when price ≤ 0 €/MWh):
-  Generation volume                    :  124663.70 MWh
-  Total revenue                        : 8656668.23 €
-  Capture price                        :      69.44 €/MWh
-
---- Existing Dispatch Profile ---
-  Profile CSV                          : inputs/dispatch_results_contracted_2023.csv
-  Profile charging volume (stored)     :   31048.29 MWh
-  Profile discharging volume (stored)  :   31098.29 MWh
-  Profile AC charging volume           :   32727.77 MWh
-  Profile AC discharging volume        :   29502.43 MWh
+--- Renewable Generation Summary ---
+  Total uncurtailed generation (MWh)         :  132101.72
+  Total curtailed generation (MWh)           :  124663.70
+  Curtailment volume (MWh)                   :    7438.01
+  Weighted avg price, curtailed gen (€/MWh)  :      69.44
+  Weighted avg price, uncurtailed gen (€/MWh) :      65.22
