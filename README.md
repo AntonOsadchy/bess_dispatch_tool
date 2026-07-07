@@ -266,29 +266,6 @@ ch_btm[t]  =  ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t
            =  ch_mwh[t] − ch_grid_mwh[t]
 ```
 
-#### Charging sources
-
-In co-location mode total charging `ch_mwh[t]` draws from four distinct sources:
-
-| Source | Definition | Exportable? | Tariff treatment |
-|--------|-----------|-------------|-----------------|
-| **Grid** | `ch_grid_mwh[t]` | — | `charge_tariff` on import + `discharge_tariff` on eventual export |
-| **Exportable BTM generation** | `gen_avail[t] = min(generation_mwh[t] − gen_curt[t], export_connection_dt)` | Yes, but used for BTM charging instead | Both tariffs exempt; opportunity cost: foregone export revenue |
-| **Curtailed generation** | `gen_curt[t] = generation_mwh[t]` if `price[t] ≤ curtailment_threshold`, else `0` | No — price too low, would be curtailed | Both tariffs exempt; no opportunity cost (would have been wasted) |
-| **Surplus (clipped) generation** | `gen_surplus[t] = max(0, (generation_mwh[t] − gen_curt[t]) − export_connection_dt)` | No — exceeds export connection | Both tariffs exempt; no opportunity cost |
-
-The three BTM sources sum to total available generation:
-
-```
-gen_avail[t] + gen_curt[t] + gen_surplus[t] = generation_mwh[t]
-```
-
-so the BTM-charged share is bounded by total generation:
-
-```
-ch_btm[t]  =  ch_mwh[t] − ch_grid_mwh[t]  ≤  generation_mwh[t]
-```
-
 **C3 — Export headroom** — generation occupies part of the export connection; the BESS can only use the remainder:
 
 ```
