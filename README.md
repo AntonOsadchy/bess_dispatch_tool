@@ -336,12 +336,23 @@ applies only to the two sources with real opportunity cost.
 
 `charge_tariff` is replaced by `ctariff[t]` when a per-timestep consumption tariff series is supplied.
 
-**Coded form** (as implemented):
+**Coded form** (as implemented — `standalone_term` applies always, `colocation_addendum_term` is
+added only in co-location mode, per `profit_rule` in `src/bess_dispatch_opt.py`):
 
 ```
-max  Σ_t [ price[t]         × (dsch_mwh[t] − ch_mwh[t])
-         + price[t]         × (ch_from_gen_curt[t] + ch_from_gen_surplus[t])
-         − discharge_tariff × dsch_mwh[t]
-         + discharge_tariff × ch_from_gen_avail[t]
-         − charge_tariff    × ch_grid_mwh[t] ]
+standalone_term[t]          =  price[t]         × (dsch_mwh[t] − ch_mwh[t])
+                              − discharge_tariff × dsch_mwh[t]
+                              − charge_tariff    × ch_mwh[t]
+
+colocation_addendum_term[t] =  charge_tariff    × ch_btm[t]
+                              + price[t]         × (ch_from_gen_curt[t] + ch_from_gen_surplus[t])
+                              + discharge_tariff × ch_from_gen_avail[t]
+
+max  Σ_t [ standalone_term[t] + colocation_addendum_term[t] ]   (co-location mode)
+max  Σ_t   standalone_term[t]                                    (stand-alone mode)
 ```
+
+where `ch_btm[t] = ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t]`. The
+`+ charge_tariff × ch_btm[t]` term refunds the tariff `standalone_term` charged on all of
+`ch_mwh[t]`, leaving only the grid-imported share (`ch_mwh[t] − ch_btm[t] = ch_grid_mwh[t]`) taxed
+— algebraically identical to `− charge_tariff × ch_grid_mwh[t]`.
