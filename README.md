@@ -310,15 +310,6 @@ their own availability (B6, B7).
 
 **O2 — Co-location** replaces O1 (maximise over all timesteps):
 
-Total charging splits into two physically distinct streams:
-
-```
-ch_mwh[t]  =  ch_btm[t]  +  ch_grid_mwh[t]
-```
-
-where `ch_btm[t] = ch_mwh[t] − ch_grid_mwh[t]` is energy charged behind the meter from generation
-(never crossing the import meter, so exempt from both tariffs).
-
 **Full form** — all revenue and cost terms explicit:
 
 ```
@@ -347,11 +338,3 @@ max  Σ_t [ price[t]         × (dsch_mwh[t] − ch_mwh[t])
          + discharge_tariff × ch_from_gen_avail[t]
          − charge_tariff    × ch_grid_mwh[t] ]
 ```
-
-Verification:
-
-| Scenario | `ch_grid` | `ch_from_gen_avail` | Net tariff |
-|----------|-----------|---------------------|------------|
-| Fully BTM from gen_avail | 0 | `ch_mwh` | `discharge_tariff × (ch_mwh − dsch)` → 0 at perfect RTE ✓ |
-| Fully BTM from gen_curt or gen_surplus | 0 | 0 | `− discharge_tariff × dsch` (pays export tariff) ✓ |
-| Fully grid | `ch_mwh` | 0 | `− discharge_tariff × dsch − charge_tariff × ch_mwh` ✓ |
