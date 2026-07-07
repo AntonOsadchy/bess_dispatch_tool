@@ -102,17 +102,23 @@ Docker Desktop alone is enough.
 
 | Key | Required | Description |
 |---|---|---|
-| `prices_csv` | yes | Path to single-column price CSV (€/MWh, one row per hour) |
+| `prices_csv` | yes | Path to single-column price CSV (€/MWh, one row per hour); accepts a bracketed list `[a.csv, b.csv]` to run multiple simulations in one go |
 | `output_csv` | yes | Path for the output CSV |
+| `output_suffix` | no | String appended to output filenames before the extension (e.g. `_v2` → `dispatch_results_v2.csv`); omit or leave blank for the default name |
 | `power` | yes | Rated AC power (MW) |
 | `capacity_mwh` | yes | Usable energy capacity (MWh) |
 | `round_trip_efficiency` | yes | Grid-to-grid round-trip efficiency (0–1] |
 | `charge_tariff` | no | Extra cost per MWh charged at the grid meter (default 0) |
 | `discharge_tariff` | no | Extra cost per MWh discharged at the grid meter (default 0) |
+| `curtailment_price` | no | Price threshold (€/MWh) at or below which co-located generation is treated as curtailed; defaults to `discharge_tariff` when omitted |
 | `max_cycles` | no | Cap on equivalent full cycles over the horizon; comment out to disable |
-| `grid_connection_mw` | no | Grid connection limit in MW; caps both imports and exports each timestep |
-| `generation_profile_csv` | no | Uncomment to enable co-location mode (single-column headerless capacity-factor CSV) |
+| `grid_import_mw` | no | Grid connection import capacity (MW); caps how much the BESS can charge from the grid each timestep |
+| `grid_export_mw` | no | Grid connection export capacity (MW); caps how much the BESS can discharge to the grid each timestep |
+| `grid_connection_mw` | no | Legacy key: sets both `grid_import_mw` and `grid_export_mw` to this value if neither split key is set |
+| `consumption_tariff_csv` | no | Path to a single-column, headerless per-timestep charge tariff CSV (€/MWh); overrides scalar `charge_tariff` for every timestep when set |
+| `generation_profile_csv` | no | Uncomment to enable co-location mode (single-column, headerless capacity-factor CSV `[0–1]`, one row per timestep) |
 | `generation_max_mw` | no* | Nameplate capacity of the co-located generator (MW); required when `generation_profile_csv` is set |
+| `existing_dispatch_profile_csv` | no | Path to a prior run's output CSV (needs `charge_mwh`/`discharge_mwh` columns) that the BESS must honour as a dispatch floor; the optimizer finds additional value on top |
 
 \* Required only when `generation_profile_csv` is active.
 
