@@ -116,37 +116,73 @@ Docker Desktop alone is enough.
 
 \* Required only when `generation_profile_csv` is active.
 
-### Model variables
-
-Pyomo decision variables and parameters built from the spec/CSV inputs (see `build_and_solve` in `src/bess_dispatch_opt.py`). One entry per timestep `t` unless noted otherwise.
-
-| Name | Kind | Bounds / value | Mode | Description |
-|---|---|---|---|---|
-| `price[t]` | Param | from `prices_csv` | all | Spot price (€/MWh) |
-| `ctariff[t]` | Param | from `consumption_tariff_csv` | optional | Per-timestep charge tariff (€/MWh); overrides scalar `charge_tariff` when set |
-| `gen_curt[t]` | Param | `generation_mwh[t]` if `price[t] ≤ curtailment_threshold`, else `0` | co-location only | Generation fully curtailed for the hour (e.g. negative-price hours); would not be exported at all |
-| `gen_avail[t]` | Param | `min(generation_mwh[t] − gen_curt[t], export_connection_dt)` | co-location only | Exportable generation available for BTM charging or direct export |
-| `gen_surplus[t]` | Param | `max(0, (generation_mwh[t] − gen_curt[t]) − export_connection_dt)` | co-location only | Clipped, non-curtailed generation beyond export connection capacity; free BTM charging source |
-| `profile_ch_param[t]` / `profile_dsch_param[t]` | Param | from `existing_dispatch_profile_csv`, converted to grid-side via `η_leg` | optional | Pre-committed charge/discharge floor that `ch_mwh[t]` / `dsch_mwh[t]` must meet or exceed |
-| `soc_mwh[t]` | Var | `[0, capacity_mwh]` | all | Battery state of charge at end of timestep |
-| `ch_mwh[t]` | Var | `[0, min(power, grid_import_mw)×dt]` (stand-alone) / `[0, power×dt]` (co-location) | all | Total charging; stand-alone = grid import, co-location = BTM + grid combined |
-| `dsch_mwh[t]` | Var | `[0, min(power, grid_export_mw)×dt]` | all | Grid export (discharge) |
-| `ch_grid_mwh[t]` | Var | `[0, grid_import_mw×dt]` (pinned to `max(0, ch_mwh[t] − gen_avail[t] − gen_curt[t] − gen_surplus[t])` by C4/C5) | co-location only | Grid-imported share of charging |
-| `ch_from_gen_avail[t]` | Var | `[0, gen_avail[t]]` (pinned to `min(ch_btm[t], gen_avail[t])` by B5/C6) | co-location only | BTM charging sourced from exportable generation (discharge-tariff-refund-eligible share) |
-
-Derived (not separate Pyomo variables, computed from the above): `ch_btm[t] = ch_mwh[t] − ch_grid_mwh[t]` — total behind-the-meter charging in a timestep.
-
 ### Grid connection limit
 
 When `grid_connection_mw` is set, both `ch_mwh[t]` (grid import) and `dsch_mwh[t]` (grid export)
 are bounded by `grid_connection_mw × interval_hours` each timestep.  If the BESS rated power
 (`power`) is lower, the tighter of the two limits applies.
 
-### Co-location mode
+## Stand-alone model
+
+This section describes the LP as it exists with no generation profile configured
+(`generation_profile_csv` unset). See [Co-location mode](#co-location-mode) below for what
+changes when a co-located generator is added.
+
+### Model variables
+
+Pyomo decision variables and parameters built from the spec/CSV inputs (see `build_and_solve` in `src/bess_dispatch_opt.py`). One entry per timestep `t` unless noted otherwise.
+
+| Name | Kind | Bounds / value | Description |
+|---|---|---|---|
+| `price[t]` | Param | from `prices_csv` | Spot price (€/MWh) |
+| `ctariff[t]` | Param | from `consumption_tariff_csv` (optional) | Per-timestep charge tariff (€/MWh); overrides scalar `charge_tariff` when set |
+| `profile_ch_param[t]` / `profile_dsch_param[t]` | Param | from `existing_dispatch_profile_csv` (optional), converted to grid-side via `η_leg` | Pre-committed charge/discharge floor that `ch_mwh[t]` / `dsch_mwh[t]` must meet or exceed |
+| `soc_mwh[t]` | Var | `[0, capacity_mwh]` | Battery state of charge at end of timestep |
+| `ch_mwh[t]` | Var | `[0, min(power, grid_import_mw)×dt]` | Total charging = grid import |
+| `dsch_mwh[t]` | Var | `[0, min(power, grid_export_mw)×dt]` | Grid export (discharge) |
+
+### Variable bounds
+
+| Label | Constraint | Notes |
+|-------|-----------|-------|
+| **B1** | `0 ≤ soc_mwh[t] ≤ capacity_mwh` | SOC within usable battery limits |
+| **B2** | `0 ≤ ch_mwh[t] ≤ min(power_mw, grid_import_mw) × dt` | Total charging bounded by BESS power rating and grid import cap |
+| **B3** | `0 ≤ dsch_mwh[t] ≤ min(power_mw, grid_export_mw) × dt` | Grid export bounded by BESS power rating and export connection |
+
+### Constraints
+
+**C1 — SOC energy balance** (`η_leg = √round_trip_efficiency`):
+
+```
+soc_mwh[0] = SOC_INITIAL × capacity_mwh + ch_mwh[0] × η_leg − dsch_mwh[0] / η_leg
+soc_mwh[t] = soc_mwh[t-1]              + ch_mwh[t] × η_leg − dsch_mwh[t] / η_leg   ∀ t > 0
+```
+
+**C2 — Lifetime cycle cap** (optional; omit `max_cycles` to disable):
+
+```
+η_leg × Σ_t ch_mwh[t] ≤ max_cycles × capacity_mwh
+```
+
+### Objective
+
+**O1 — Stand-alone** (maximise over all timesteps):
+
+```
+max  Σ_t [ price[t] × (dsch_mwh[t] − ch_mwh[t])
+         − discharge_tariff × dsch_mwh[t]
+         − charge_tariff    × ch_mwh[t] ]
+```
+
+`charge_tariff` is replaced by `ctariff[t]` when a per-timestep consumption tariff series is supplied.
+
+## Co-location mode
 
 Uncomment `generation_profile_csv` in the spec to enable co-location mode.
 The profile CSV must be a **single-column, headerless** file of capacity factors [0–1],
 one row per timestep (same layout as the prices CSV, e.g. `solar_profile_Denmark_1h_2024.csv`).
+The BESS is then co-located behind the meter with a generator, and can charge from the grid,
+from the generator, or a combination of both.
 
 Available generation per timestep:
 
@@ -154,50 +190,40 @@ Available generation per timestep:
 generation_mwh[t] = capacity_factor[t] × generation_max_mw × interval_hours
 ```
 
-Two LP constraints are added in co-location mode:
+Everything in [Stand-alone model](#stand-alone-model) still applies; this section lists what is
+added or changed on top of it.
 
-**1. Discharge headroom** — generation occupies part of the grid connection; the BESS can only export what remains:
+### Additional variables and parameters
+
+| Name | Kind | Bounds / value | Description |
+|---|---|---|---|
+| `gen_curt[t]` | Param | `generation_mwh[t]` if `price[t] ≤ curtailment_threshold`, else `0` | Generation fully curtailed for the hour (e.g. negative-price hours); would not be exported at all |
+| `gen_avail[t]` | Param | `min(generation_mwh[t] − gen_curt[t], export_connection_dt)` | Exportable generation available for BTM charging or direct export |
+| `gen_surplus[t]` | Param | `max(0, (generation_mwh[t] − gen_curt[t]) − export_connection_dt)` | Clipped, non-curtailed generation beyond export connection capacity; free BTM charging source |
+| `ch_grid_mwh[t]` | Var | `[0, grid_import_mw×dt]` (pinned to `max(0, ch_mwh[t] − gen_avail[t] − gen_curt[t] − gen_surplus[t])` by C4/C5) | Grid-imported share of charging |
+| `ch_from_gen_avail[t]` | Var | `[0, gen_avail[t]]` (pinned to `min(ch_btm[t], gen_avail[t])` by B5/C6) | BTM charging sourced from exportable generation (discharge-tariff-refund-eligible share) |
+
+Derived (not a separate Pyomo variable, computed from the above): `ch_btm[t] = ch_mwh[t] − ch_grid_mwh[t]` — total behind-the-meter charging in a timestep.
+
+### Modified and additional bounds
+
+`ch_mwh[t]` (**B2**) is redefined: in co-location mode it represents total charging (BTM + grid
+combined), and the import cap moves to the new `ch_grid_mwh[t]` variable instead:
 
 ```
-dsch_mwh[t] ≤ connection_mwh - generation_mwh[t]
+0 ≤ ch_mwh[t] ≤ power_mw × dt
 ```
 
-where `connection_mwh = grid_connection_mw × interval_hours` (falls back to `power × interval_hours` if `grid_connection_mw` is not set).
-
-**2. BTM charge tariff split** — charging up to available generation flows behind the meter and is not taxed; only charging above generation incurs `charge_tariff`:
-
-```
-taxable_charge[t] = max(0, ch_mwh[t] - generation_mwh[t])
-```
-
-Grid import for charging is otherwise unaffected by the generation profile.
-The output CSV gains `generation_mw`, `charge_btm_mwh`, and `charge_grid_mwh` columns.
-
-## Optimisation model
-
-### Variable bounds
+Two additional bounds:
 
 | Label | Constraint | Notes |
 |-------|-----------|-------|
-| **B1** | `0 ≤ soc_mwh[t] ≤ capacity_mwh` | SOC within usable battery limits |
-| **B2** | `0 ≤ ch_mwh[t] ≤ min(power_mw, grid_import_mw) × dt` (stand-alone) | Total charging bounded by BESS power rating; in stand-alone mode grid import cap applied here directly |
-| | `0 ≤ ch_mwh[t] ≤ power_mw × dt` (co-location) | In co-location mode the import cap moves to `ch_grid_mwh` — see B4 |
-| **B3** | `0 ≤ dsch_mwh[t] ≤ min(power_mw, grid_export_mw) × dt` | Grid export bounded by BESS power rating and export connection |
-| **B4** | `0 ≤ ch_grid_mwh[t] ≤ grid_import_mw × dt` (co-location only) | Grid-imported share of charging bounded by import connection; falls back to `power_mw × dt` if `grid_import_mw` not set |
-| **B5** | `0 ≤ ch_from_gen_avail[t] ≤ gen_avail[t]` (co-location only) | BTM charging from exportable generation; upper-bounded by available exportable generation per timestep |
+| **B4** | `0 ≤ ch_grid_mwh[t] ≤ grid_import_mw × dt` | Grid-imported share of charging bounded by import connection; falls back to `power_mw × dt` if `grid_import_mw` not set |
+| **B5** | `0 ≤ ch_from_gen_avail[t] ≤ gen_avail[t]` | BTM charging from exportable generation; upper-bounded by available exportable generation per timestep |
 
-### Explicit constraints (all modes)
+### Additional constraints
 
-**C1 — SOC energy balance** (`η_leg = √round_trip_efficiency`):
-
-Stand-alone:
-
-```
-soc_mwh[0] = SOC_INITIAL × capacity_mwh + ch_mwh[0] × η_leg − dsch_mwh[0] / η_leg
-soc_mwh[t] = soc_mwh[t-1]              + ch_mwh[t] × η_leg − dsch_mwh[t] / η_leg   ∀ t > 0
-```
-
-Co-location (charging expanded into three sources):
+**C1 is expanded** — total charging in the SOC balance splits into three sources instead of one:
 
 ```
 soc_mwh[0] = SOC_INITIAL × capacity_mwh
@@ -208,8 +234,6 @@ soc_mwh[t] = soc_mwh[t-1]
            + (ch_grid_mwh[t] + ch_from_gen_avail[t] + ch_from_free_gen[t]) × η_leg
            − dsch_mwh[t] / η_leg   ∀ t > 0
 ```
-
-where the three charging terms correspond to the sources defined in the table above:
 
 | Term | Source |
 |------|--------|
@@ -225,14 +249,6 @@ ch_btm[t]  =  ch_from_gen_avail[t] + ch_from_free_gen[t]
            ≤  gen_avail[t] + gen_curt[t] + gen_surplus[t]
            =  generation_mwh[t]
 ```
-
-**C2 — Lifetime cycle cap** (optional; omit `max_cycles` to disable):
-
-```
-η_leg × Σ_t ch_mwh[t] ≤ max_cycles × capacity_mwh
-```
-
-### Co-location constraints
 
 #### Charging sources
 
@@ -295,17 +311,9 @@ Combined with B5 this pins `ch_from_gen_avail[t] = min(ch_btm[t], gen_avail[t])`
 drives it to this value naturally because `ch_from_gen_avail` earns a `discharge_tariff` refund in
 the objective.
 
-### Objective
+### Objective addendum
 
-**O1 — Stand-alone** (maximise over all timesteps):
-
-```
-max  Σ_t [ price[t] × (dsch_mwh[t] − ch_mwh[t])
-         − discharge_tariff × dsch_mwh[t]
-         − charge_tariff    × ch_mwh[t] ]
-```
-
-**O2 — Co-location** (maximise over all timesteps):
+**O2 — Co-location** replaces O1 (maximise over all timesteps):
 
 Total charging splits into two physically distinct streams:
 
@@ -352,4 +360,3 @@ Verification:
 | Fully BTM from gen_avail | 0 | `ch_mwh` | `discharge_tariff × (ch_mwh − dsch)` → 0 at perfect RTE ✓ |
 | Fully BTM from gen_curt or gen_surplus | 0 | 0 | `− discharge_tariff × dsch` (pays export tariff) ✓ |
 | Fully grid | `ch_mwh` | 0 | `− discharge_tariff × dsch − charge_tariff × ch_mwh` ✓ |
-
