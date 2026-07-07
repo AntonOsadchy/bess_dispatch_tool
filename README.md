@@ -108,13 +108,13 @@ Docker Desktop alone is enough.
 | `power` | yes | Rated AC power (MW) |
 | `capacity_mwh` | yes | Usable energy capacity (MWh) |
 | `round_trip_efficiency` | yes | Grid-to-grid round-trip efficiency (0–1] |
+| `initial_soc` | no | Initial state of charge as a fraction of `capacity_mwh` [0–1] (default 0.5) |
 | `charge_tariff` | no | Extra cost per MWh charged at the grid meter (default 0) |
 | `discharge_tariff` | no | Extra cost per MWh discharged at the grid meter (default 0) |
 | `curtailment_price` | no | Price threshold (€/MWh) at or below which co-located generation is treated as curtailed; defaults to `discharge_tariff` when omitted |
 | `max_cycles` | no | Cap on equivalent full cycles over the horizon; comment out to disable |
 | `grid_import_mw` | no | Grid connection import capacity (MW); caps how much the BESS can charge from the grid each timestep |
 | `grid_export_mw` | no | Grid connection export capacity (MW); caps how much the BESS can discharge to the grid each timestep |
-| `grid_connection_mw` | no | Legacy key: sets both `grid_import_mw` and `grid_export_mw` to this value if neither split key is set |
 | `consumption_tariff_csv` | no | Path to a single-column, headerless per-timestep charge tariff CSV (€/MWh); overrides scalar `charge_tariff` for every timestep when set |
 | `generation_profile_csv` | no | Uncomment to enable co-location mode (single-column, headerless capacity-factor CSV `[0–1]`, one row per timestep) |
 | `generation_max_mw` | no* | Nameplate capacity of the co-located generator (MW); required when `generation_profile_csv` is set |
@@ -124,8 +124,8 @@ Docker Desktop alone is enough.
 
 ### Grid connection limit
 
-When `grid_connection_mw` is set, both `ch_mwh[t]` (grid import) and `dsch_mwh[t]` (grid export)
-are bounded by `grid_connection_mw × interval_hours` each timestep.  If the BESS rated power
+`grid_import_mw` bounds `ch_mwh[t]` (grid import) and `grid_export_mw` bounds `dsch_mwh[t]`
+(grid export), each to `grid_*_mw × interval_hours` per timestep. If the BESS rated power
 (`power`) is lower, the tighter of the two limits applies.
 
 ## Stand-alone model
@@ -143,6 +143,7 @@ Pyomo decision variables and parameters built from the spec/CSV inputs (see `bui
 | `price[t]` | Param | from `prices_csv` | Spot price (€/MWh) |
 | `ctariff[t]` | Param | from `consumption_tariff_csv` (optional) | Per-timestep charge tariff (€/MWh); overrides scalar `charge_tariff` when set |
 | `profile_ch_param[t]` / `profile_dsch_param[t]` | Param | from `existing_dispatch_profile_csv` (optional), converted to grid-side via `η_leg` | Pre-committed charge/discharge floor that `ch_mwh[t]` / `dsch_mwh[t]` must meet or exceed |
+| `initial_soc` | scalar (not indexed by `t`) | from `initial_soc` (default 0.5) | Initial state of charge as a fraction of `capacity_mwh`, applied at `t=0` in C1 |
 | `soc_mwh[t]` | Var | `[0, capacity_mwh]` | Battery state of charge at end of timestep |
 | `ch_mwh[t]` | Var | `[0, min(power, grid_import_mw)×dt]` | Total charging = grid import |
 | `dsch_mwh[t]` | Var | `[0, min(power, grid_export_mw)×dt]` | Grid export (discharge) |
@@ -160,7 +161,7 @@ Pyomo decision variables and parameters built from the spec/CSV inputs (see `bui
 **C1 — SOC energy balance** (`η_leg = √round_trip_efficiency`):
 
 ```
-soc_mwh[0] = SOC_INITIAL × capacity_mwh + ch_mwh[0] × η_leg − dsch_mwh[0] / η_leg
+soc_mwh[0] = initial_soc × capacity_mwh + ch_mwh[0] × η_leg − dsch_mwh[0] / η_leg
 soc_mwh[t] = soc_mwh[t-1]              + ch_mwh[t] × η_leg − dsch_mwh[t] / η_leg   ∀ t > 0
 ```
 
@@ -207,9 +208,11 @@ added or changed on top of it.
 | `gen_avail[t]` | Param | `min(generation_mwh[t] − gen_curt[t], export_connection_dt)` | Exportable generation available for BTM charging or direct export |
 | `gen_surplus[t]` | Param | `max(0, (generation_mwh[t] − gen_curt[t]) − export_connection_dt)` | Clipped, non-curtailed generation beyond export connection capacity; free BTM charging source |
 | `ch_grid_mwh[t]` | Var | `[0, grid_import_mw×dt]` (pinned to `max(0, ch_mwh[t] − gen_avail[t] − gen_curt[t] − gen_surplus[t])` by C4/C5) | Grid-imported share of charging |
-| `ch_from_gen_avail[t]` | Var | `[0, gen_avail[t]]` (pinned to `min(ch_btm[t], gen_avail[t])` by B5/C6) | BTM charging sourced from exportable generation (discharge-tariff-refund-eligible share) |
+| `ch_from_gen_avail[t]` | Var | `[0, gen_avail[t]]` (pinned to `min(ch_btm[t], gen_avail[t])` by B5, C6) | BTM charging sourced from `gen_avail[t]` (discharge-tariff-refund-eligible share) |
+| `ch_from_gen_curt[t]` | Var | `[0, gen_curt[t]]` (B6, C6) | BTM charging sourced from `gen_curt[t]` (no discharge-tariff refund) |
+| `ch_from_gen_surplus[t]` | Var | `[0, gen_surplus[t]]` (B7, C6) | BTM charging sourced from `gen_surplus[t]` (no discharge-tariff refund) |
 
-Derived (not a separate Pyomo variable, computed from the above): `ch_btm[t] = ch_mwh[t] − ch_grid_mwh[t]` — total behind-the-meter charging in a timestep.
+Derived (not a separate Pyomo variable): `ch_btm[t] = ch_mwh[t] − ch_grid_mwh[t] = ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t]` — total behind-the-meter charging in a timestep, exactly attributed across its three sources by C6.
 
 ### Modified and additional bounds
 
@@ -220,37 +223,46 @@ combined), and the import cap moves to the new `ch_grid_mwh[t]` variable instead
 0 ≤ ch_mwh[t] ≤ power_mw × dt
 ```
 
-Two additional bounds:
+Four additional bounds:
 
 | Label | Constraint | Notes |
 |-------|-----------|-------|
 | **B4** | `0 ≤ ch_grid_mwh[t] ≤ grid_import_mw × dt` | Grid-imported share of charging bounded by import connection; falls back to `power_mw × dt` if `grid_import_mw` not set |
-| **B5** | `0 ≤ ch_from_gen_avail[t] ≤ gen_avail[t]` | BTM charging from exportable generation; upper-bounded by available exportable generation per timestep |
+| **B5** | `0 ≤ ch_from_gen_avail[t] ≤ gen_avail[t]` | BTM charging sourced from exportable generation; upper-bounded by availability per timestep |
+| **B6** | `0 ≤ ch_from_gen_curt[t] ≤ gen_curt[t]` | BTM charging sourced from curtailed generation; upper-bounded by availability per timestep |
+| **B7** | `0 ≤ ch_from_gen_surplus[t] ≤ gen_surplus[t]` | BTM charging sourced from surplus generation; upper-bounded by availability per timestep |
 
 ### Additional constraints
 
-**C1 is expanded** — total charging in the SOC balance splits into three sources instead of one:
+**C1 is expanded** — total charging in the SOC balance splits into four sources instead of one:
 
 ```
-soc_mwh[0] = SOC_INITIAL × capacity_mwh
-           + (ch_grid_mwh[0] + ch_from_gen_avail[0] + ch_from_free_gen[0]) × η_leg
+soc_mwh[0] = initial_soc × capacity_mwh
+           + (ch_grid_mwh[0] + ch_from_gen_avail[0] + ch_from_gen_curt[0] + ch_from_gen_surplus[0]) × η_leg
            − dsch_mwh[0] / η_leg
 
 soc_mwh[t] = soc_mwh[t-1]
-           + (ch_grid_mwh[t] + ch_from_gen_avail[t] + ch_from_free_gen[t]) × η_leg
+           + (ch_grid_mwh[t] + ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t]) × η_leg
            − dsch_mwh[t] / η_leg   ∀ t > 0
 ```
 
 | Term | Source |
 |------|--------|
 | `ch_grid_mwh[t]` | Grid import |
-| `ch_from_gen_avail[t]` | BTM charging from exportable generation |
-| `ch_from_free_gen[t]` | BTM charging from curtailed (`gen_curt`) or clipped surplus (`gen_surplus`) generation |
+| `ch_from_gen_avail[t]` | BTM charging sourced from exportable generation |
+| `ch_from_gen_curt[t]` | BTM charging sourced from curtailed generation |
+| `ch_from_gen_surplus[t]` | BTM charging sourced from surplus (clipped) generation |
 
-The individual split between `ch_from_gen_avail` and `ch_from_free_gen` is not tracked separately — only their combined BTM share matters for the SOC:
+`ch_from_gen_curt[t]` and `ch_from_gen_surplus[t]` get identical (no-refund) tariff treatment in the
+objective, so the LP has no economic preference between them — in practice at most one of
+`gen_curt[t]`/`gen_surplus[t]` is nonzero in a given hour anyway (a curtailed hour has no export
+connection headroom left over to be "surplus"), so the split is not actually ambiguous in the
+solved model.
+
+The three BTM terms are pinned by an equality (C6), not just bounded above:
 
 ```
-ch_btm[t]  =  ch_from_gen_avail[t] + ch_from_free_gen[t]
+ch_btm[t]  =  ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t]
            =  ch_mwh[t] − ch_grid_mwh[t]
            ≤  gen_avail[t] + gen_curt[t] + gen_surplus[t]
            =  generation_mwh[t]
@@ -307,15 +319,17 @@ ch_grid_mwh[t] ≤ ch_mwh[t]
 
 Prevents `ch_grid_mwh` from being inflated when `charge_tariff = 0` gives no cost signal.
 
-**C6 — Gen-avail BTM charging ceiling**:
+**C6 — BTM charging source split**:
 
 ```
-ch_from_gen_avail[t] ≤ ch_mwh[t] − ch_grid_mwh[t]
+ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t] = ch_mwh[t] − ch_grid_mwh[t]
 ```
 
-Combined with B5 this pins `ch_from_gen_avail[t] = min(ch_btm[t], gen_avail[t])`. The optimizer
+BTM charging is fully attributed across the three sources (equality, not just an upper bound).
+Combined with B5 this pins `ch_from_gen_avail[t] = min(ch_btm[t], gen_avail[t])` — the optimizer
 drives it to this value naturally because `ch_from_gen_avail` earns a `discharge_tariff` refund in
-the objective.
+the objective, while `ch_from_gen_curt[t]` and `ch_from_gen_surplus[t]` split the remainder up to
+their own availability (B6, B7).
 
 ### Objective addendum
 

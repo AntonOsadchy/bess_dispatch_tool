@@ -12,8 +12,6 @@ Optional max equivalent cycles; charge/discharge tariffs apply to grid MWh (same
 Grid connection limits (optional, independent):
   grid_import_mw  — limits how much the BESS can draw from the grid each interval.
   grid_export_mw  — limits how much the BESS can export to the grid each interval.
-  grid_connection_mw — legacy key; sets both import and export to the same value if the
-                       split keys are absent (backward compatibility).
 
 Stand-alone mode (no generation profile):
   ch_mwh[t]   ≤ min(power_mw, grid_import_mw)  × dt   (total charging = grid import)
@@ -60,15 +58,18 @@ Three additional constraints are added in co-location mode:
            — it physically crosses the export meter, so discharge_tariff APPLIES.
 
       Auxiliary variables:
-          ch_grid_mwh[t]:       grid-imported share of charging [B4, C4, C5]
-          ch_from_gen_avail[t]: BTM charging from exportable generation only [B5, C6]
-                                (the discharge_tariff-exempt portion of BTM charging)
+          ch_grid_mwh[t]:         grid-imported share of charging [B4, C4, C5]
+          ch_from_gen_avail[t]:   BTM charging sourced from gen_avail[t] [B5, C6]
+                                  (the discharge_tariff-exempt portion of BTM charging)
+          ch_from_gen_curt[t]:    BTM charging sourced from gen_curt[t] [B6, C6]
+          ch_from_gen_surplus[t]: BTM charging sourced from gen_surplus[t] [B7, C6]
 
       ch_grid_mwh[t] is pinned to max(0, ch_mwh[t] − gen_avail[t] − gen_curt[t] − gen_surplus[t]).
-      ch_from_gen_avail[t] is pinned to min(ch_btm[t], gen_avail[t]).
-      The optimizer drives both to their natural values because
-          ch_grid_mwh pays (charge_tariff + discharge_tariff) per MWh
-          ch_from_gen_avail earns back discharge_tariff per MWh.
+      ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t] == ch_btm[t] (C6), each
+      individually capped by its own source (B5-B7). ch_from_gen_curt and ch_from_gen_surplus get
+      identical (no-refund) tariff treatment, so the LP has no preference between them — only their
+      sum matters economically; ch_from_gen_avail is driven to its natural value min(ch_btm[t],
+      gen_avail[t]) because, unlike the other two, it earns back discharge_tariff per MWh.
 
      Objective tariff terms in co-location mode:
          − charge_tariff × ch_grid_mwh[t]
@@ -96,7 +97,8 @@ import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
 
 
-SOC_INITIAL = 0.5
+# Default initial SOC (fraction of capacity_mwh), used when initial_soc is not set in the spec.
+DEFAULT_INITIAL_SOC = 0.5
 # Hours represented by each price row (not read from specification.txt).
 INTERVAL_HOURS = 1.0
 
@@ -247,10 +249,13 @@ def build_and_solve(
     consumption_tariffs: list[float] | None = None,
     existing_dispatch_stored: tuple[list[float], list[float]] | None = None,
     curtailment_threshold: float | None = None,
+    initial_soc: float = DEFAULT_INITIAL_SOC,
 ) -> tuple[pyo.ConcreteModel, pyo.SolverResults]:
     rte = round_trip_efficiency
     if not (0 < rte <= 1):
         sys.exit("round_trip_efficiency must be in (0, 1]")
+    if not (0 <= initial_soc <= 1):
+        sys.exit("initial_soc must be in [0, 1]")
     T = len(prices)
     if T == 0:
         sys.exit("Empty price series")
@@ -319,7 +324,7 @@ def build_and_solve(
     def soc_rule(mm, i):
         if i == 0:
             return (
-                mm.soc_mwh[0] - SOC_INITIAL * cap
+                mm.soc_mwh[0] - initial_soc * cap
                 == mm.ch_mwh[0] * eta_leg - mm.dsch_mwh[0] / eta_leg
             )
         return (
@@ -416,17 +421,30 @@ def build_and_solve(
 
         m.ch_grid_ub = pyo.Constraint(m.T, rule=ch_grid_ub_rule)  # [C5]
 
-        # ch_from_gen_avail[t]: BTM charging from exportable generation (gen_avail portion only).
-        # Discharge of this share is discharge_tariff-exempt; gen_curt/gen_surplus discharge is not [B5].
+        # Per-source BTM charging split: ch_from_gen_avail/_curt/_surplus[t] track exactly how much
+        # charging was drawn from each of the three generation streams. Only ch_from_gen_avail
+        # earns a discharge_tariff refund [B5]; gen_curt/gen_surplus discharge is not
+        # discharge_tariff-exempt, so the objective has no preference between ch_from_gen_curt and
+        # ch_from_gen_surplus for a given hour — any feasible split satisfying C6 below (bounded by
+        # each source's own availability [B6, B7]) is equally optimal.
         m.ch_from_gen_avail = pyo.Var(
             m.T, bounds=lambda mm, t: (0.0, pyo.value(mm.gen_avail[t]))
         )
+        m.ch_from_gen_curt = pyo.Var(
+            m.T, bounds=lambda mm, t: (0.0, pyo.value(mm.gen_curt[t]))
+        )
+        m.ch_from_gen_surplus = pyo.Var(
+            m.T, bounds=lambda mm, t: (0.0, pyo.value(mm.gen_surplus[t]))
+        )
 
-        def ch_gen_avail_btm_rule(mm, t):
-            # Cannot exceed total BTM charging (ch_mwh - ch_grid_mwh = ch_btm).
-            return mm.ch_from_gen_avail[t] <= mm.ch_mwh[t] - mm.ch_grid_mwh[t]
+        def ch_btm_split_rule(mm, t):
+            # BTM charging (ch_mwh - ch_grid_mwh) is fully attributed across the three sources.
+            return (
+                mm.ch_from_gen_avail[t] + mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t]
+                == mm.ch_mwh[t] - mm.ch_grid_mwh[t]
+            )
 
-        m.ch_gen_avail_btm = pyo.Constraint(m.T, rule=ch_gen_avail_btm_rule)  # [C6]
+        m.ch_btm_split = pyo.Constraint(m.T, rule=ch_btm_split_rule)  # [C6]
 
     def profit_rule(mm):
         if generation_mwh is not None:
@@ -485,7 +503,6 @@ def write_output(
     curtailment_threshold: float,
     generation_mwh: list[float] | None = None,
     consumption_tariffs: list[float] | None = None,
-    surplus_generation_mwh: list[float] | None = None,
     existing_dispatch_stored: tuple[list[float], list[float]] | None = None,
 ) -> None:
     eta_leg = math.sqrt(round_trip_efficiency)
@@ -536,7 +553,8 @@ def write_output(
             row_generation_mw               = gen_mwh_t / INTERVAL_HOURS
             row_charge_btm_mwh              = ch_btm
             row_charge_grid_mwh             = ch_grid_taxable
-            row_charge_surplus_mwh          = min(ch_btm, surplus_generation_mwh[t]) if surplus_generation_mwh is not None else 0.0
+            row_charge_curtailed_mwh        = pyo.value(model.ch_from_gen_curt[t])
+            row_charge_surplus_mwh          = pyo.value(model.ch_from_gen_surplus[t])
             row_generation_mwh              = gen_mwh_t
             row_generation_rev_uncurtailed  = (p - discharge_tariff) * gen_mwh_t
             row_generation_curtailed_mwh    = gen_gen_curtailed
@@ -548,6 +566,7 @@ def write_output(
             row_generation_mw               = 0.0
             row_charge_btm_mwh              = 0.0
             row_charge_grid_mwh             = ch_grid_taxable
+            row_charge_curtailed_mwh        = 0.0
             row_charge_surplus_mwh          = 0.0
             row_generation_mwh              = 0.0
             row_generation_rev_uncurtailed  = 0.0
@@ -572,6 +591,7 @@ def write_output(
             "generation_mw": row_generation_mw,
             "charge_btm_mwh": row_charge_btm_mwh,
             "charge_grid_mwh": row_charge_grid_mwh,
+            "charge_curtailed_mwh": row_charge_curtailed_mwh,
             "charge_surplus_mwh": row_charge_surplus_mwh,
             "generation_mwh": row_generation_mwh,
             "generation_revenue_uncurtailed": row_generation_rev_uncurtailed,
@@ -648,17 +668,15 @@ def main() -> None:
     curtailment_threshold = curtailment_price_raw if curtailment_price_raw is not None else discharge_tariff
     max_cycles = spec_optional_float(spec, "max_cycles")
     capacity_mwh = spec_float(spec, "capacity_mwh")
+    initial_soc = spec_float(spec, "initial_soc", default=DEFAULT_INITIAL_SOC)
+    if not (0 <= initial_soc <= 1):
+        sys.exit("initial_soc must be in [0, 1]")
 
     # Grid connection: split import / export limits.
     # grid_import_mw  — caps how much the BESS can draw from the grid (charging).
     # grid_export_mw  — caps how much the BESS can push to the grid (discharging).
-    # grid_connection_mw — legacy key: sets both if neither split key is present.
     grid_import_mw = spec_optional_float(spec, "grid_import_mw")
     grid_export_mw = spec_optional_float(spec, "grid_export_mw")
-    grid_connection_mw = spec_optional_float(spec, "grid_connection_mw")
-    if grid_import_mw is None and grid_export_mw is None and grid_connection_mw is not None:
-        grid_import_mw = grid_connection_mw
-        grid_export_mw = grid_connection_mw
 
     # Optional per-timestep consumption tariff CSV (overrides scalar charge_tariff when set).
     consumption_tariff_csv = spec_optional_str(spec, "consumption_tariff_csv")
@@ -734,6 +752,7 @@ def main() -> None:
             consumption_tariffs=consumption_tariffs,
             existing_dispatch_stored=existing_dispatch_stored,
             curtailment_threshold=curtailment_threshold,
+            initial_soc=initial_soc,
         )
 
         ok = (
@@ -749,11 +768,6 @@ def main() -> None:
         total_profit = pyo.value(model.obj)
         Tn = len(prices)
 
-        # Surplus generation per timestep, read back from the solved model (curtailment-aware).
-        surplus_generation_mwh: list[float] | None = None
-        if generation_mwh is not None:
-            surplus_generation_mwh = [pyo.value(model.gen_surplus[t]) for t in range(Tn)]
-
         # Single pass over all timesteps — compute all summary stats together.
         total_export_mwh    = 0.0
         total_export_revenue = 0.0
@@ -763,6 +777,7 @@ def main() -> None:
         spot_gross          = 0.0
         tariff_component    = 0.0
         curtailment_reduction_charge = 0.0  # BTM charge attributable to curtailment (pre-efficiency)
+        total_surplus_charged_mwh: float | None = 0.0 if generation_mwh is not None else None
 
         for t in range(Tn):
             p        = prices[t]
@@ -771,17 +786,15 @@ def main() -> None:
             eff_ct   = consumption_tariffs[t] if consumption_tariffs is not None else charge_tariff
 
             if generation_mwh is not None:
-                ch_grid              = pyo.value(model.ch_grid_mwh[t])
-                ch_btm               = ch_total - ch_grid
-                ch_from_gen_avail_t  = pyo.value(model.ch_from_gen_avail[t])
-                # Curtailment-reduction charge: all BTM charge during a price-curtailed hour
-                # (the whole hour's generation would otherwise be wasted), or just the
-                # surplus-sourced share during a non-curtailed hour (only the portion beyond
-                # the grid connection would otherwise be wasted).
-                if p <= curtailment_threshold:
-                    curtailment_reduction_charge += ch_btm
-                else:
-                    curtailment_reduction_charge += min(ch_btm, surplus_generation_mwh[t])
+                ch_grid               = pyo.value(model.ch_grid_mwh[t])
+                ch_btm                = ch_total - ch_grid
+                ch_from_gen_avail_t   = pyo.value(model.ch_from_gen_avail[t])
+                ch_from_gen_curt_t    = pyo.value(model.ch_from_gen_curt[t])
+                ch_from_gen_surplus_t = pyo.value(model.ch_from_gen_surplus[t])
+                # Curtailment-reduction charge: BTM charge sourced from curtailed or surplus
+                # generation — both would otherwise have been wasted this hour.
+                curtailment_reduction_charge += ch_from_gen_curt_t + ch_from_gen_surplus_t
+                total_surplus_charged_mwh += ch_from_gen_surplus_t
             else:
                 ch_grid              = ch_total
                 ch_btm               = 0.0
@@ -840,17 +853,6 @@ def main() -> None:
         # Profit normalised to 365 cycles: total profit divided by 365.
         profit_365_cycles_normalized = total_profit / 365.0
 
-        # Total energy charged from surplus (clipped) generation — co-location only.
-        total_surplus_charged_mwh: float | None = None
-        if surplus_generation_mwh is not None:
-            eta_leg_val = math.sqrt(rte)
-            total_surplus_charged_mwh = 0.0
-            for t in range(len(prices)):
-                ch_total = pyo.value(model.ch_mwh[t])
-                ch_grid = pyo.value(model.ch_grid_mwh[t])
-                ch_btm = ch_total - ch_grid
-                total_surplus_charged_mwh += min(ch_btm, surplus_generation_mwh[t])
-
         write_output(
             output_path,
             prices,
@@ -862,7 +864,6 @@ def main() -> None:
             curtailment_threshold=curtailment_threshold,
             generation_mwh=generation_mwh,
             consumption_tariffs=consumption_tariffs,
-            surplus_generation_mwh=surplus_generation_mwh,
             existing_dispatch_stored=existing_dispatch_stored,
         )
 
@@ -891,6 +892,7 @@ def main() -> None:
         report_lines.append(f"  BESS power                           : {power_mw:>10.2f} MW")
         report_lines.append(f"  BESS capacity                        : {capacity_mwh:>10.2f} MWh")
         report_lines.append(f"  Round-trip efficiency                : {rte*100:>10.1f} %")
+        report_lines.append(f"  Initial SOC                          : {initial_soc*100:>10.1f} %")
         report_lines.append(f"  Grid import cap                      : {grid_import_mw if grid_import_mw is not None else power_mw:>10.2f} MW")
         report_lines.append(f"  Grid export cap                      : {grid_export_mw if grid_export_mw is not None else power_mw:>10.2f} MW")
         report_lines.append(f"  Max cycles                           : {'unlimited' if max_cycles is None else f'{max_cycles:>6.0f}':>10}")

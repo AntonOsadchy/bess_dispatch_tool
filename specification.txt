@@ -17,6 +17,9 @@ capacity_mwh = 100
 # Round-trip efficiency (0–1]: symmetric one-way efficiency is √(this). Stored MWh gained = grid_import_mwh × √η_rt; per grid MWh exported, stored drops by 1/√η_rt (so grid-to-grid round-trip = η_rt).
 round_trip_efficiency = 0.9
 
+# Optional: initial state of charge as a fraction of capacity_mwh [0-1]. Defaults to 0.5 if omitted.
+#initial_soc = 0.5
+
 # Extra cost per MWh charged / discharged (same units as prices); omit or set 0 to disable
 #charge_tariff = 0
 discharge_tariff = 1.38

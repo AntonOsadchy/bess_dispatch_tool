@@ -11,6 +11,7 @@
   BESS power                           :      50.00 MW
   BESS capacity                        :     100.00 MWh
   Round-trip efficiency                :       90.0 %
+  Initial SOC                          :       50.0 %
   Grid import cap                      :       0.00 MW
   Grid export cap                      :      90.00 MW
   Max cycles                           :  unlimited
@@ -36,8 +37,8 @@
   Profit per cycle per MW              :     136.88 €/cycle/MW
   Profit / 365 cycles (normalised)     :    5851.33 €/cycle
   Profit / 365 cycles per MW           :     117.03 €/cycle/MW
-  BESS curtailment reduction           :    4042.04 MWh
-  BESS charged from surplus generation :     248.61 MWh
+  BESS curtailment reduction           :    3818.29 MWh
+  BESS charged from surplus generation :       0.00 MWh
 
 --- Renewable Generation Summary ---
   Total uncurtailed generation (MWh)         :  132101.72
