@@ -58,18 +58,21 @@ Three additional constraints are added in co-location mode:
            — it physically crosses the export meter, so discharge_tariff APPLIES.
 
       Auxiliary variables:
-          ch_grid_mwh[t]:         grid-imported share of charging [B4, C4, C5]
-          ch_from_gen_avail[t]:   BTM charging sourced from gen_avail[t] [B5, C6]
+          ch_grid_mwh[t]:         grid-imported share of charging [B4, C4]
+          ch_from_gen_avail[t]:   BTM charging sourced from gen_avail[t] [B5, C5]
                                   (the discharge_tariff-exempt portion of BTM charging)
-          ch_from_gen_curt[t]:    BTM charging sourced from gen_curt[t] [B6, C6]
-          ch_from_gen_surplus[t]: BTM charging sourced from gen_surplus[t] [B7, C6]
+          ch_from_gen_curt[t]:    BTM charging sourced from gen_curt[t] [B6, C5]
+          ch_from_gen_surplus[t]: BTM charging sourced from gen_surplus[t] [B7, C5]
 
-      ch_grid_mwh[t] is pinned to max(0, ch_mwh[t] − gen_avail[t] − gen_curt[t] − gen_surplus[t]).
-      ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t] == ch_btm[t] (C6), each
-      individually capped by its own source (B5-B7). ch_from_gen_curt and ch_from_gen_surplus get
-      identical (no-refund) tariff treatment, so the LP has no preference between them — only their
-      sum matters economically; ch_from_gen_avail is driven to its natural value min(ch_btm[t],
-      gen_avail[t]) because, unlike the other two, it earns back discharge_tariff per MWh.
+      ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t] == ch_btm[t] (C5), each
+      individually capped by its own source (B5-B7). Summing those three caps and substituting C5
+      shows ch_grid_mwh[t] >= ch_mwh[t] − gen_avail[t] − gen_curt[t] − gen_surplus[t] automatically
+      — no separate lower-bound constraint on ch_grid_mwh is needed. ch_from_gen_curt and
+      ch_from_gen_surplus get identical (no-refund) tariff treatment, so the LP has no preference
+      between them — only their sum matters economically; ch_from_gen_avail is driven to its
+      natural value min(ch_btm[t], gen_avail[t]) because, unlike the other two, it earns back
+      discharge_tariff per MWh (except when price[t] is negative enough that grid import itself
+      becomes more profitable than free BTM charging — see README for the full derivation).
 
      Objective in co-location mode adds, on top of price[t] × (dsch_mwh[t] − ch_mwh[t]):
          + price[t] × (ch_from_gen_curt[t] + ch_from_gen_surplus[t])   — spot opportunity-cost
@@ -316,7 +319,7 @@ def build_and_solve(
     # dsch_mwh: grid export, always bounded by min(power_mw, grid_export_mw).
     m.dsch_mwh = pyo.Var(m.T, bounds=(0.0, max_dsch_mwh))
 
-    # Constraints [B1-B4, C1-C5] and objective [O1-O2] — see README.md § "Optimisation model"
+    # Constraints [B1-B7, C1-C5] and objective [O1-O2] — see README.md § "Optimisation model"
 
     def soc_rule(mm, i):
         if i == 0:
@@ -403,27 +406,22 @@ def build_and_solve(
         # ch_grid_mwh[t]: grid-imported share of charging, bounded by import connection [B4].
         m.ch_grid_mwh = pyo.Var(m.T, bounds=(0.0, max_grid_import_mwh))
 
-        def ch_grid_lb_rule(mm, t):
-            # Grid import is only needed when charging exceeds all three free BTM sources
-            # (exportable generation gen_avail[t], curtailed gen_curt[t], and surplus gen_surplus[t]).
-            return (
-                mm.ch_grid_mwh[t]
-                >= mm.ch_mwh[t] - mm.gen_avail[t] - mm.gen_curt[t] - mm.gen_surplus[t]
-            )
-
-        m.ch_grid_lb = pyo.Constraint(m.T, rule=ch_grid_lb_rule)  # [C4]
-
         def ch_grid_ub_rule(mm, t):
             return mm.ch_grid_mwh[t] <= mm.ch_mwh[t]
 
-        m.ch_grid_ub = pyo.Constraint(m.T, rule=ch_grid_ub_rule)  # [C5]
+        m.ch_grid_ub = pyo.Constraint(m.T, rule=ch_grid_ub_rule)  # [C4]
 
         # Per-source BTM charging split: ch_from_gen_avail/_curt/_surplus[t] track exactly how much
         # charging was drawn from each of the three generation streams. Only ch_from_gen_avail
         # earns a discharge_tariff refund [B5]; gen_curt/gen_surplus discharge is not
         # discharge_tariff-exempt, so the objective has no preference between ch_from_gen_curt and
-        # ch_from_gen_surplus for a given hour — any feasible split satisfying C6 below (bounded by
+        # ch_from_gen_surplus for a given hour — any feasible split satisfying C5 below (bounded by
         # each source's own availability [B6, B7]) is equally optimal.
+        #
+        # Note: a grid-import lower bound (ch_grid_mwh[t] >= ch_mwh[t] - gen_avail[t] - gen_curt[t]
+        # - gen_surplus[t]) is NOT needed as a separate constraint — it's implied by summing the
+        # B5/B6/B7 upper bounds and substituting C5 below, so imposing it explicitly would be
+        # redundant (verified: deactivating it changes neither the objective nor any solved value).
         m.ch_from_gen_avail = pyo.Var(
             m.T, bounds=lambda mm, t: (0.0, pyo.value(mm.gen_avail[t]))
         )
@@ -441,7 +439,7 @@ def build_and_solve(
                 == mm.ch_mwh[t] - mm.ch_grid_mwh[t]
             )
 
-        m.ch_btm_split = pyo.Constraint(m.T, rule=ch_btm_split_rule)  # [C6]
+        m.ch_btm_split = pyo.Constraint(m.T, rule=ch_btm_split_rule)  # [C5]
 
     def standalone_term(mm, t):
         # O1 — stand-alone objective term. Applied unconditionally: in co-location mode this
@@ -462,7 +460,7 @@ def build_and_solve(
         #     cost standalone_term charged on this share — it would have been wasted (curtailed or
         #     clipped) regardless, so it has zero true opportunity cost.
         #   + discharge_tariff * ch_from_gen_avail: refund for the only BTM source whose later
-        #     discharge doesn't create new net export (see B5/C6 discussion above).
+        #     discharge doesn't create new net export (see B5/C5 discussion above).
         ct = mm.ctariff[t] if consumption_tariffs is not None else charge_tariff
         ch_btm_t = mm.ch_from_gen_avail[t] + mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t]
         return (

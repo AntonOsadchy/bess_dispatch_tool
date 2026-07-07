@@ -207,12 +207,12 @@ added or changed on top of it.
 | `gen_curt[t]` | Param | `generation_mwh[t]` if `price[t] ≤ curtailment_threshold`, else `0` | Generation fully curtailed for the hour (e.g. negative-price hours); would not be exported at all |
 | `gen_avail[t]` | Param | `min(generation_mwh[t] − gen_curt[t], export_connection_dt)` | Exportable generation available for BTM charging or direct export |
 | `gen_surplus[t]` | Param | `max(0, (generation_mwh[t] − gen_curt[t]) − export_connection_dt)` | Clipped, non-curtailed generation beyond export connection capacity; free BTM charging source |
-| `ch_grid_mwh[t]` | Var | `[0, grid_import_mw×dt]` (pinned to `max(0, ch_mwh[t] − gen_avail[t] − gen_curt[t] − gen_surplus[t])` by C4/C5) | Grid-imported share of charging |
-| `ch_from_gen_avail[t]` | Var | `[0, gen_avail[t]]` (pinned to `min(ch_btm[t], gen_avail[t])` by B5, C6) | BTM charging sourced from `gen_avail[t]` (discharge-tariff-refund-eligible share) |
-| `ch_from_gen_curt[t]` | Var | `[0, gen_curt[t]]` (B6, C6) | BTM charging sourced from `gen_curt[t]` (no discharge-tariff refund) |
-| `ch_from_gen_surplus[t]` | Var | `[0, gen_surplus[t]]` (B7, C6) | BTM charging sourced from `gen_surplus[t]` (no discharge-tariff refund) |
+| `ch_grid_mwh[t]` | Var | `[0, grid_import_mw×dt]` (B4; also `≤ ch_mwh[t]` via C4) | Grid-imported share of charging |
+| `ch_from_gen_avail[t]` | Var | `[0, gen_avail[t]]` (pinned to `min(ch_btm[t], gen_avail[t])` by B5, C5) | BTM charging sourced from `gen_avail[t]` (discharge-tariff-refund-eligible share) |
+| `ch_from_gen_curt[t]` | Var | `[0, gen_curt[t]]` (B6, C5) | BTM charging sourced from `gen_curt[t]` (no discharge-tariff refund) |
+| `ch_from_gen_surplus[t]` | Var | `[0, gen_surplus[t]]` (B7, C5) | BTM charging sourced from `gen_surplus[t]` (no discharge-tariff refund) |
 
-Derived (not a separate Pyomo variable): `ch_btm[t] = ch_mwh[t] − ch_grid_mwh[t] = ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t]` — total behind-the-meter charging in a timestep, exactly attributed across its three sources by C6.
+Derived (not a separate Pyomo variable): `ch_btm[t] = ch_mwh[t] − ch_grid_mwh[t] = ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t]` — total behind-the-meter charging in a timestep, exactly attributed across its three sources by C5.
 
 ### Modified and additional bounds
 
@@ -259,7 +259,7 @@ objective, so the LP has no economic preference between them — in practice at 
 connection headroom left over to be "surplus"), so the split is not actually ambiguous in the
 solved model.
 
-The three BTM terms are pinned by an equality (C6), not just bounded above:
+The three BTM terms are pinned by an equality (C5), not just bounded above:
 
 ```
 ch_btm[t]  =  ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t]
@@ -275,18 +275,7 @@ dsch_mwh[t] ≤ export_connection_dt − gen_avail[t]
 where `export_connection_dt = grid_export_mw × dt` (or `power_mw × dt`), and  
 `gen_avail[t] = min(generation_mwh[t] − gen_curt[t], export_connection_dt)`.
 
-**C4 — Lower bound on grid import** — forces `ch_grid_mwh > 0` only when total charging exceeds all three BTM sources:
-
-```
-ch_grid_mwh[t] ≥ ch_mwh[t] − gen_avail[t] − gen_curt[t] − gen_surplus[t]
-```
-
-Combined with B4 this pins `ch_grid_mwh[t] = max(0, ch_mwh[t] − gen_avail[t] − gen_curt[t] − gen_surplus[t])`,  
-where `gen_curt[t]` is fully curtailed generation (price too low to export) and `gen_surplus[t]` is clipped  
-generation beyond the export connection — both are free to charge the BESS.  
-Rearranged: BTM share `ch_mwh[t] − ch_grid_mwh[t] ≤ gen_avail[t] + gen_curt[t] + gen_surplus[t]`.
-
-**C5 — Grid import ceiling**:
+**C4 — Grid import ceiling**:
 
 ```
 ch_grid_mwh[t] ≤ ch_mwh[t]
@@ -294,7 +283,7 @@ ch_grid_mwh[t] ≤ ch_mwh[t]
 
 Prevents `ch_grid_mwh` from being inflated when `charge_tariff = 0` gives no cost signal.
 
-**C6 — BTM charging source split**:
+**C5 — BTM charging source split**:
 
 ```
 ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t] = ch_mwh[t] − ch_grid_mwh[t]
@@ -305,6 +294,15 @@ Combined with B5 this pins `ch_from_gen_avail[t] = min(ch_btm[t], gen_avail[t])`
 drives it to this value naturally because `ch_from_gen_avail` earns a `discharge_tariff` refund in
 the objective, while `ch_from_gen_curt[t]` and `ch_from_gen_surplus[t]` split the remainder up to
 their own availability (B6, B7).
+
+Note there is no separate "grid import lower bound" constraint: summing the B5/B6/B7 upper bounds
+and substituting C5 gives `ch_mwh[t] − ch_grid_mwh[t] ≤ gen_avail[t] + gen_curt[t] + gen_surplus[t]`,
+i.e. `ch_grid_mwh[t] ≥ ch_mwh[t] − gen_avail[t] − gen_curt[t] − gen_surplus[t]`, automatically — an
+explicit constraint to that effect would be redundant with B5–B7 and C5 (confirmed by deactivating
+it and re-solving: identical objective and identical `ch_grid_mwh[t]` at every timestep). Note this
+does *not* mean `ch_grid_mwh[t]` is always pinned to that floor — when `price[t]` is negative enough
+that grid import itself earns more than the `charge_tariff` cost, the optimizer prefers grid import
+over "free" `gen_curt`/`gen_surplus` charging and uses more than the floor requires.
 
 ### Objective addendum
 
