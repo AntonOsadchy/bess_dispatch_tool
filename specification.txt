@@ -1,79 +1,32 @@
-# BESS dispatch — key = value (lines starting with # ignored)
-
-prices_csv = [inputs/prices_spot_DK2_1h_2023.csv]
-
-output_csv = outputs/dispatch_results.csv
-# Optional: string appended to output filenames before the extension (e.g. _v2 → dispatch_results_v2.csv).
-# Omit or leave blank to use the default name.
+# BESS dispatch config — key = value. Full documentation of every key: README.md § "Specification keys".
 output_suffix = _upside_2023
-# One price row = one hour (interval length is fixed in src/bess_dispatch_opt.py).
+output_csv = outputs/dispatch_results.csv
 
-# Rated AC power MW; max grid MWh per row = power * interval_hours (interval_hours is 1.0 in code).
-power = 50
-
-# Usable energy capacity MWh
-capacity_mwh = 100
-
-# Round-trip efficiency (0–1]: symmetric one-way efficiency is √(this). Stored MWh gained = grid_import_mwh × √η_rt; per grid MWh exported, stored drops by 1/√η_rt (so grid-to-grid round-trip = η_rt).
-round_trip_efficiency = 0.9
-
-# Extra cost per MWh charged / discharged (same units as prices); omit or set 0 to disable
-#charge_tariff = 0
-discharge_tariff = 1.38
-
-# Optional: price threshold below which co-located generation is curtailed (€/MWh, same units as prices).
-# When commented out, defaults to discharge_tariff above.
-# Set explicitly to decouple curtailment reporting from the export tariff.
-curtailment_price = 0.00
-
-# Optional: per-timestep consumption tariff time-series (€/MWh).
-# Single-column, headerless CSV — one value per timestep, same layout as prices_csv.
-# When set, this series overrides the scalar charge_tariff above for every timestep.
-# Uncomment and set the path to enable.
+prices_csv = inputs/prices_spot_DK2_1h_2023.csv
 consumption_tariff_csv = inputs/tariffs_consumption_energinet_DK2_1h_2026.csv
+generation_profile_csv = inputs/Egemarke_2023_profile.csv
+#existing_dispatch_profile_csv = inputs/dispatch_results_contracted_2023.csv
 
-# Optional: grid connection import capacity in MW.
-# Limits how much the BESS can charge from the grid each timestep.
-# In co-located mode the BESS can also charge behind the meter from the generation profile,
-# up to gen_avail[t]; grid import adds on top of that, capped here. Total charging is still
-# bounded by the BESS rated power (power = above).
-# If omitted, only the BESS rated power applies.
-grid_import_mw = 50
-
-# Optional: grid connection export capacity in MW.
-# Limits how much the BESS can discharge to the grid each timestep.
-# In co-located mode generation already occupies part of this connection; BESS export is
-# limited to the remaining headroom: dsch_mwh[t] <= grid_export_mw - gen_avail[t].
-# If omitted, only the BESS rated power applies.
+grid_import_mw = 0
 grid_export_mw = 90
 
-
-# --- Co-location (optional) ---
-# Uncomment generation_profile_csv to enable co-location mode.
-# The file must be a single-column, headerless CSV of capacity factors [0–1], one row per timestep
-# (same layout as the prices CSV, e.g. solar_profile_Denmark_1h_2024.csv).
-# generation_max_mw is the nameplate capacity of the co-located generator (MW); it is required
-# when generation_profile_csv is set.
-# In co-location mode BESS discharge (grid export) is capped at generation_max_mw × capacity_factor
-# each timestep. Grid import for charging is unaffected.
-generation_profile_csv = inputs/Egemarke_2023_profile.csv
-#generation_max_mw = 1
-
-# Optional: max equivalent cycles: √(round_trip_efficiency) × sum(grid charge MWh) / capacity_mwh (stored charge / capacity).
-# Comment out or remove to disable.
+power = 50
+capacity_mwh = 200
+round_trip_efficiency = 0.9
+#initial_soc = 0.5
 #max_cycles = 365
 
-# Optional: pre-committed dispatch profile that the BESS must comply with.
-# When set, the BESS must honour this schedule at every timestep (as a minimum floor) and the
-# optimizer finds additional value on top using the remaining capacity headroom (e.g. grid arbitrage
-# on top of a BTM-only dispatch). Typical workflow:
-#   1. Run a first optimisation (e.g. BTM / co-location) → produces dispatch_results.csv
-#   2. Set this parameter to that output file
-#   3. Run again — the BESS honours the prior dispatch and optimises incremental arbitrage on top.
-# The file must be a named-column CSV with at least:
-#   charge_mwh     (stored-side charging MWh per timestep)
-#   discharge_mwh  (stored-side discharging MWh per timestep)
-# This matches the column names in the output CSV produced by this tool.
-# The profile length must match the price series.
-existing_dispatch_profile_csv = inputs/dispatch_results_contracted_2023.csv
+#charge_tariff = 0
+discharge_tariff = 1.38
+curtailment_price = 0.00
+
+#generation_max_mw = 1
+
+
+
+
+
+
+
+
 

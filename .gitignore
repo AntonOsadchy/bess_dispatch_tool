@@ -1,0 +1,5 @@
+*.csv
+*.xlsx
+*.txt
+!specification.txt
+!docker/requirements.txt
