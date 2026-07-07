@@ -23,21 +23,21 @@
   Generating hours                     :       4371 h
 
 --- BESS Results ---
-  Spot revenue (gross, before tariffs) : 2136964.37 €
-  Tariff charges                       :   -4450.97 €
-  Total profit                         : 2141415.35 €
-  Charging volume                      :   32727.77 MWh
-  Weighted avg charging cost           :      51.41 €/MWh
-  Discharging volume                   :   29502.43 MWh
-  Weighted avg discharge profit        :     129.61 €/MWh
-  Vol × avg price cross-check          : 2141415.35 €
-  Equivalent full cycles               :     310.48 cycles
-  Profit per cycle                     :    6897.05 €/cycle
-  Profit per cycle per MW              :     137.94 €/cycle/MW
-  Profit / 365 cycles (normalised)     :    5866.89 €/cycle
-  Profit / 365 cycles per MW           :     117.34 €/cycle/MW
-  BESS curtailment reduction           :    3993.76 MWh
-  BESS charged from surplus generation :     337.26 MWh
+  Spot revenue (gross, before tariffs) : 2137116.06 €
+  Tariff charges                       :    1380.85 €
+  Total profit                         : 2135735.21 €
+  Charging volume                      :   32893.61 MWh
+  Weighted avg charging cost           :      51.10 €/MWh
+  Discharging volume                   :   29651.68 MWh
+  Weighted avg discharge profit        :     128.71 €/MWh
+  Vol × avg price cross-check          : 2135735.21 €
+  Equivalent full cycles               :     312.06 cycles
+  Profit per cycle                     :    6844.07 €/cycle
+  Profit per cycle per MW              :     136.88 €/cycle/MW
+  Profit / 365 cycles (normalised)     :    5851.33 €/cycle
+  Profit / 365 cycles per MW           :     117.03 €/cycle/MW
+  BESS curtailment reduction           :    4042.04 MWh
+  BESS charged from surplus generation :     248.61 MWh
 
 --- Renewable Generation Summary ---
   Total uncurtailed generation (MWh)         :  132101.72

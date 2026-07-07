@@ -40,15 +40,22 @@ Three additional constraints are added in co-location mode:
 
    3. Tariff treatment of BTM-charged energy:
       charge_tariff is exempt for all BTM charging (energy never crossed the import meter).
-      discharge_tariff treatment differs between the two BTM sources:
+      discharge_tariff treatment differs between the three BTM sources:
 
-        a) gen_avail[t] = min(generation_mwh[t], export_connection_dt)
+        a) gen_avail[t] = min(generation_mwh[t] − gen_curt[t], export_connection_dt)
            Exportable generation used for BTM charging instead of direct export.
            Discharging this energy later replaces export that would have happened anyway
            — no new net export is created, so discharge_tariff is EXEMPT.
 
-        b) surplus_gen[t] = max(0, generation_mwh[t] − export_connection_dt)
-           Clipped generation that cannot be exported (connection full).
+        b) gen_curt[t] = generation_mwh[t] if price[t] ≤ curtailment_threshold else 0
+           Generation that is fully curtailed for the hour (e.g. negative-price hours) —
+           it would not have been exported at all, so there is no export it could displace.
+           Discharging BESS energy sourced from it creates NEW export, but the source
+           itself was worthless (would have been wasted), so discharge_tariff APPLIES
+           (same treatment as surplus, no refund — see ch_from_gen_avail below).
+
+        c) gen_surplus[t] = max(0, (generation_mwh[t] − gen_curt[t]) − export_connection_dt)
+           Clipped, non-curtailed generation that cannot be exported (connection full).
            Discharging this energy creates NEW export that would not otherwise occur
            — it physically crosses the export meter, so discharge_tariff APPLIES.
 
@@ -57,7 +64,7 @@ Three additional constraints are added in co-location mode:
           ch_from_gen_avail[t]: BTM charging from exportable generation only [B5, C6]
                                 (the discharge_tariff-exempt portion of BTM charging)
 
-      ch_grid_mwh[t] is pinned to max(0, ch_mwh[t] − gen_avail[t] − surplus_gen[t]).
+      ch_grid_mwh[t] is pinned to max(0, ch_mwh[t] − gen_avail[t] − gen_curt[t] − gen_surplus[t]).
       ch_from_gen_avail[t] is pinned to min(ch_btm[t], gen_avail[t]).
       The optimizer drives both to their natural values because
           ch_grid_mwh pays (charge_tariff + discharge_tariff) per MWh
@@ -70,7 +77,7 @@ Three additional constraints are added in co-location mode:
      Verification:
          fully BTM gen_avail cycle (ch_grid=0, ch_from_gen_avail=ch_mwh):
              tariff = dsch_t × (ch_mwh − dsch) = 0 for perfect RTE ✓
-         fully BTM surplus_gen cycle (ch_grid=0, ch_from_gen_avail=0):
+         fully BTM gen_curt or gen_surplus cycle (ch_grid=0, ch_from_gen_avail=0):
              tariff = −dsch_t × dsch  (pays discharge tariff) ✓
          fully grid cycle (ch_grid=ch_mwh, ch_from_gen_avail=0):
              tariff = −ch_t × ch_mwh − dsch_t × dsch ✓
@@ -239,6 +246,7 @@ def build_and_solve(
     grid_export_mw: float | None = None,
     consumption_tariffs: list[float] | None = None,
     existing_dispatch_stored: tuple[list[float], list[float]] | None = None,
+    curtailment_threshold: float | None = None,
 ) -> tuple[pyo.ConcreteModel, pyo.SolverResults]:
     rte = round_trip_efficiency
     if not (0 < rte <= 1):
@@ -351,14 +359,28 @@ def build_and_solve(
             grid_export_mw if grid_export_mw is not None else power_mw
         ) * dt
 
+        # Curtailed generation: fully curtailed (would not be exported at all) whenever the spot
+        # price is at or below curtailment_threshold — e.g. negative-price hours. Falls back to
+        # discharge_tariff when no explicit threshold is supplied, matching main()'s default.
+        curt_threshold = (
+            curtailment_threshold if curtailment_threshold is not None else discharge_tariff
+        )
+        gen_curt_param = {
+            t: (generation_mwh[t] if prices[t] <= curt_threshold else 0.0) for t in times
+        }
+        m.gen_curt = pyo.Param(m.T, initialize=gen_curt_param)
+
+        # Generation left after curtailment is what could actually be exported.
+        remaining_gen = {t: generation_mwh[t] - gen_curt_param[t] for t in times}
+
         # Cap generation at export connection capacity so discharge headroom never goes negative.
-        gen_param = {t: min(generation_mwh[t], export_connection_dt) for t in times}
+        gen_param = {t: min(remaining_gen[t], export_connection_dt) for t in times}
         m.gen_avail = pyo.Param(m.T, initialize=gen_param)
 
-        # Surplus generation: clipped portion that cannot be exported (free BTM charging source).
-        # surplus_gen[t] = max(0, generation_mwh[t] − export_connection_dt)
-        surplus_param = {t: max(0.0, generation_mwh[t] - export_connection_dt) for t in times}
-        m.surplus_gen = pyo.Param(m.T, initialize=surplus_param)
+        # Surplus generation: clipped, non-curtailed portion that cannot be exported
+        # (free BTM charging source). gen_surplus[t] = max(0, remaining_gen[t] − export_connection_dt)
+        surplus_param = {t: max(0.0, remaining_gen[t] - export_connection_dt) for t in times}
+        m.gen_surplus = pyo.Param(m.T, initialize=surplus_param)
 
         # Guard: profile discharge must not exceed the export headroom available after generation.
         if existing_dispatch_stored is not None:
@@ -380,9 +402,12 @@ def build_and_solve(
         m.ch_grid_mwh = pyo.Var(m.T, bounds=(0.0, max_grid_import_mwh))
 
         def ch_grid_lb_rule(mm, t):
-            # Grid import is only needed when charging exceeds both BTM sources
-            # (exportable generation gen_avail[t] and free surplus surplus_gen[t]).
-            return mm.ch_grid_mwh[t] >= mm.ch_mwh[t] - mm.gen_avail[t] - mm.surplus_gen[t]
+            # Grid import is only needed when charging exceeds all three free BTM sources
+            # (exportable generation gen_avail[t], curtailed gen_curt[t], and surplus gen_surplus[t]).
+            return (
+                mm.ch_grid_mwh[t]
+                >= mm.ch_mwh[t] - mm.gen_avail[t] - mm.gen_curt[t] - mm.gen_surplus[t]
+            )
 
         m.ch_grid_lb = pyo.Constraint(m.T, rule=ch_grid_lb_rule)  # [C4]
 
@@ -392,7 +417,7 @@ def build_and_solve(
         m.ch_grid_ub = pyo.Constraint(m.T, rule=ch_grid_ub_rule)  # [C5]
 
         # ch_from_gen_avail[t]: BTM charging from exportable generation (gen_avail portion only).
-        # Discharge of this share is discharge_tariff-exempt; surplus_gen discharge is not [B5].
+        # Discharge of this share is discharge_tariff-exempt; gen_curt/gen_surplus discharge is not [B5].
         m.ch_from_gen_avail = pyo.Var(
             m.T, bounds=lambda mm, t: (0.0, pyo.value(mm.gen_avail[t]))
         )
@@ -408,7 +433,7 @@ def build_and_solve(
             # charge_tariff exempt for all BTM charging (no import meter crossing).
             # discharge_tariff refund applies only to ch_from_gen_avail (gen_avail-sourced BTM):
             #   gen_avail discharge replaces would-have-happened direct export → no new net export.
-            #   surplus_gen discharge creates new export → discharge_tariff applies.
+            #   gen_curt/gen_surplus discharge creates new export → discharge_tariff applies.
             if consumption_tariffs is not None:
                 return sum(
                     mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
@@ -653,18 +678,6 @@ def main() -> None:
                 sys.exit("generation_max_mw must be positive")
         generation_mwh = load_profile_csv(Path(gen_profile_csv), gen_max_mw)
 
-    # Surplus generation: clipped portion that cannot be exported (free BTM charging for BESS).
-    # Computed here (after grid_export_mw is resolved) and passed through to write_output.
-    # surplus_gen[t] = max(0, generation_mwh[t] − export_connection_dt)
-    surplus_generation_mwh: list[float] | None = None
-    if generation_mwh is not None:
-        export_connection_dt_main = (
-            grid_export_mw if grid_export_mw is not None else power_mw
-        ) * INTERVAL_HOURS
-        surplus_generation_mwh = [
-            max(0.0, g - export_connection_dt_main) for g in generation_mwh
-        ]
-
     if power_mw <= 0:
         sys.exit("power must be positive")
     if capacity_mwh <= 0:
@@ -720,6 +733,7 @@ def main() -> None:
             grid_export_mw=grid_export_mw,
             consumption_tariffs=consumption_tariffs,
             existing_dispatch_stored=existing_dispatch_stored,
+            curtailment_threshold=curtailment_threshold,
         )
 
         ok = (
@@ -734,6 +748,11 @@ def main() -> None:
 
         total_profit = pyo.value(model.obj)
         Tn = len(prices)
+
+        # Surplus generation per timestep, read back from the solved model (curtailment-aware).
+        surplus_generation_mwh: list[float] | None = None
+        if generation_mwh is not None:
+            surplus_generation_mwh = [pyo.value(model.gen_surplus[t]) for t in range(Tn)]
 
         # Single pass over all timesteps — compute all summary stats together.
         total_export_mwh    = 0.0
@@ -775,7 +794,7 @@ def main() -> None:
             # cost on BTM share (generation that could have been exported at spot price instead).
             total_charge_cost    += (p + eff_ct) * ch_grid + p * ch_btm
             # Discharge profit: spot revenue minus discharge tariff; only gen_avail-sourced BTM
-            # gets the refund (surplus_gen discharge creates new export, so tariff applies).
+            # gets the refund (gen_curt/gen_surplus discharge creates new export, so tariff applies).
             total_dsch_profit    += p * dsch - discharge_tariff * (dsch - ch_from_gen_avail_t)
             spot_gross           += p * (dsch - ch_total)
 
