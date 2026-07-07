@@ -71,17 +71,14 @@ Three additional constraints are added in co-location mode:
       sum matters economically; ch_from_gen_avail is driven to its natural value min(ch_btm[t],
       gen_avail[t]) because, unlike the other two, it earns back discharge_tariff per MWh.
 
-     Objective tariff terms in co-location mode:
+     Objective in co-location mode adds, on top of price[t] × (dsch_mwh[t] − ch_mwh[t]):
+         + price[t] × (ch_from_gen_curt[t] + ch_from_gen_surplus[t])   — spot opportunity-cost
+             refund: this BTM-charged energy would have been wasted (curtailed or clipped)
+             regardless, so — unlike gen_avail-sourced charging, which forgoes real export
+             revenue — it has zero true opportunity cost.
          − charge_tariff × ch_grid_mwh[t]
          − discharge_tariff × dsch_mwh[t]
          + discharge_tariff × ch_from_gen_avail[t]
-     Verification:
-         fully BTM gen_avail cycle (ch_grid=0, ch_from_gen_avail=ch_mwh):
-             tariff = dsch_t × (ch_mwh − dsch) = 0 for perfect RTE ✓
-         fully BTM gen_curt or gen_surplus cycle (ch_grid=0, ch_from_gen_avail=0):
-             tariff = −dsch_t × dsch  (pays discharge tariff) ✓
-         fully grid cycle (ch_grid=ch_mwh, ch_from_gen_avail=0):
-             tariff = −ch_t × ch_mwh − dsch_t × dsch ✓
 """
 
 from __future__ import annotations
@@ -452,9 +449,14 @@ def build_and_solve(
             # discharge_tariff refund applies only to ch_from_gen_avail (gen_avail-sourced BTM):
             #   gen_avail discharge replaces would-have-happened direct export → no new net export.
             #   gen_curt/gen_surplus discharge creates new export → discharge_tariff applies.
+            # price[t] * (dsch - ch_mwh) treats all charging as if it forwent spot revenue, which
+            # is only true for grid- and gen_avail-sourced charging. gen_curt/gen_surplus energy
+            # would have been wasted (curtailed or clipped) regardless, so it has zero opportunity
+            # cost — refund the spot term for that share.
             if consumption_tariffs is not None:
                 return sum(
                     mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
+                    + mm.price[t] * (mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t])
                     - discharge_tariff * mm.dsch_mwh[t]
                     + discharge_tariff * mm.ch_from_gen_avail[t]
                     - mm.ctariff[t] * mm.ch_grid_mwh[t]
@@ -462,6 +464,7 @@ def build_and_solve(
                 )
             return sum(
                 mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
+                + mm.price[t] * (mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t])
                 - discharge_tariff * mm.dsch_mwh[t]
                 + discharge_tariff * mm.ch_from_gen_avail[t]
                 - charge_tariff * mm.ch_grid_mwh[t]
@@ -524,8 +527,11 @@ def write_output(
             ch_grid_taxable = pyo.value(model.ch_grid_mwh[t])
             ch_btm = ch_total - ch_grid_taxable          # behind-the-meter share (untaxed)
             ch_from_gen_avail_t = pyo.value(model.ch_from_gen_avail[t])
+            ch_from_gen_curt_t = pyo.value(model.ch_from_gen_curt[t])
+            ch_from_gen_surplus_t = pyo.value(model.ch_from_gen_surplus[t])
             revenue = (
                 p * (dsch_grid - ch_total)
+                + p * (ch_from_gen_curt_t + ch_from_gen_surplus_t)
                 - discharge_tariff * dsch_grid
                 + discharge_tariff * ch_from_gen_avail_t
                 - eff_charge_tariff * ch_grid_taxable
@@ -553,8 +559,8 @@ def write_output(
             row_generation_mw               = gen_mwh_t / INTERVAL_HOURS
             row_charge_btm_mwh              = ch_btm
             row_charge_grid_mwh             = ch_grid_taxable
-            row_charge_curtailed_mwh        = pyo.value(model.ch_from_gen_curt[t])
-            row_charge_surplus_mwh          = pyo.value(model.ch_from_gen_surplus[t])
+            row_charge_curtailed_mwh        = ch_from_gen_curt_t
+            row_charge_surplus_mwh          = ch_from_gen_surplus_t
             row_generation_mwh              = gen_mwh_t
             row_generation_rev_uncurtailed  = (p - discharge_tariff) * gen_mwh_t
             row_generation_curtailed_mwh    = gen_gen_curtailed
@@ -799,17 +805,21 @@ def main() -> None:
                 ch_grid              = ch_total
                 ch_btm               = 0.0
                 ch_from_gen_avail_t  = 0.0
+                ch_from_gen_curt_t   = 0.0
+                ch_from_gen_surplus_t = 0.0
 
             total_export_mwh     += dsch
             total_export_revenue += p * dsch
             total_charge_mwh     += ch_total
             # Charging cost: spot + charge tariff on grid-imported share, plus spot opportunity
-            # cost on BTM share (generation that could have been exported at spot price instead).
-            total_charge_cost    += (p + eff_ct) * ch_grid + p * ch_btm
+            # cost on gen_avail-sourced BTM share only (generation that could have been exported
+            # at spot price instead). gen_curt/gen_surplus-sourced BTM charging has zero
+            # opportunity cost (would have been wasted regardless), so it is free here.
+            total_charge_cost    += (p + eff_ct) * ch_grid + p * ch_from_gen_avail_t
             # Discharge profit: spot revenue minus discharge tariff; only gen_avail-sourced BTM
             # gets the refund (gen_curt/gen_surplus discharge creates new export, so tariff applies).
             total_dsch_profit    += p * dsch - discharge_tariff * (dsch - ch_from_gen_avail_t)
-            spot_gross           += p * (dsch - ch_total)
+            spot_gross           += p * (dsch - ch_total) + p * (ch_from_gen_curt_t + ch_from_gen_surplus_t)
 
             if generation_mwh is not None:
                 tariff_component += (
