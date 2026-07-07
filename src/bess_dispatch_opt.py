@@ -443,47 +443,40 @@ def build_and_solve(
 
         m.ch_btm_split = pyo.Constraint(m.T, rule=ch_btm_split_rule)  # [C6]
 
-    def profit_rule(mm):
-        if generation_mwh is not None:
-            # charge_tariff exempt for all BTM charging (no import meter crossing).
-            # discharge_tariff refund applies only to ch_from_gen_avail (gen_avail-sourced BTM):
-            #   gen_avail discharge replaces would-have-happened direct export → no new net export.
-            #   gen_curt/gen_surplus discharge creates new export → discharge_tariff applies.
-            # price[t] * (dsch - ch_mwh) treats all charging as if it forwent spot revenue, which
-            # is only true for grid- and gen_avail-sourced charging. gen_curt/gen_surplus energy
-            # would have been wasted (curtailed or clipped) regardless, so it has zero opportunity
-            # cost — refund the spot term for that share.
-            if consumption_tariffs is not None:
-                return sum(
-                    mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
-                    + mm.price[t] * (mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t])
-                    - discharge_tariff * mm.dsch_mwh[t]
-                    + discharge_tariff * mm.ch_from_gen_avail[t]
-                    - mm.ctariff[t] * mm.ch_grid_mwh[t]
-                    for t in times
-                )
-            return sum(
-                mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
-                + mm.price[t] * (mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t])
-                - discharge_tariff * mm.dsch_mwh[t]
-                + discharge_tariff * mm.ch_from_gen_avail[t]
-                - charge_tariff * mm.ch_grid_mwh[t]
-                for t in times
-            )
-        if consumption_tariffs is not None:
-            # Per-timestep tariff replaces scalar charge_tariff.
-            return sum(
-                mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
-                - discharge_tariff * mm.dsch_mwh[t]
-                - mm.ctariff[t] * mm.ch_mwh[t]
-                for t in times
-            )
-        return sum(
+    def standalone_term(mm, t):
+        # O1 — stand-alone objective term. Applied unconditionally: in co-location mode this
+        # still taxes all of ch_mwh[t] (as if every MWh were grid-taxable) and prices all of it
+        # at spot; colocation_addendum_term below corrects both for the BTM-sourced share.
+        ct = mm.ctariff[t] if consumption_tariffs is not None else charge_tariff
+        return (
             mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
             - discharge_tariff * mm.dsch_mwh[t]
-            - charge_tariff * mm.ch_mwh[t]
-            for t in times
+            - ct * mm.ch_mwh[t]
         )
+
+    def colocation_addendum_term(mm, t):
+        # Co-location addendum on top of standalone_term — added, not substituted:
+        #   + ct * ch_btm[t]: refunds charge_tariff on BTM charging (standalone_term taxed all of
+        #     ch_mwh[t]; only the grid-imported share ch_grid_mwh[t] should actually be taxed).
+        #   + price[t] * (ch_from_gen_curt + ch_from_gen_surplus): refunds the spot opportunity
+        #     cost standalone_term charged on this share — it would have been wasted (curtailed or
+        #     clipped) regardless, so it has zero true opportunity cost.
+        #   + discharge_tariff * ch_from_gen_avail: refund for the only BTM source whose later
+        #     discharge doesn't create new net export (see B5/C6 discussion above).
+        ct = mm.ctariff[t] if consumption_tariffs is not None else charge_tariff
+        ch_btm_t = mm.ch_from_gen_avail[t] + mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t]
+        return (
+            ct * ch_btm_t
+            + mm.price[t] * (mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t])
+            + discharge_tariff * mm.ch_from_gen_avail[t]
+        )
+
+    def profit_rule(mm):
+        if generation_mwh is not None:
+            return sum(
+                standalone_term(mm, t) + colocation_addendum_term(mm, t) for t in times
+            )
+        return sum(standalone_term(mm, t) for t in times)
 
     m.obj = pyo.Objective(rule=profit_rule, sense=pyo.maximize)
 
