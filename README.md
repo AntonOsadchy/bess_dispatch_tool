@@ -308,36 +308,8 @@ their own availability (B6, B7).
 
 ### Objective addendum
 
-**O2 — Co-location** replaces O1 (maximise over all timesteps):
-
-**Full form** — all revenue and cost terms explicit:
-
-```
-max  Σ_t [   price[t]          × dsch_mwh[t]                                     (1) spot revenue from discharge
-           − price[t]          × ch_btm[t]                                        (2) spot cost of BTM charging
-           − price[t]          × ch_grid_mwh[t]                                   (3) spot cost of grid charging
-           + price[t]          × (ch_from_gen_curt[t] + ch_from_gen_surplus[t])   (4) opportunity-cost refund, gen_curt/gen_surplus share only
-           − charge_tariff     × ch_grid_mwh[t]                                   (5) import tariff, grid share only
-           − discharge_tariff  × dsch_mwh[t]                                      (6) export tariff on all discharge
-           + discharge_tariff  × ch_from_gen_avail[t]  ]                          (7) export tariff refund, gen_avail share only
-```
-
-Terms (2)+(3)+(4) collapse to `− price[t] × (ch_grid_mwh[t] + ch_from_gen_avail[t])` — the spot term
-applies only to the two sources with real opportunity cost.
-
-**Term (4) applies only to `ch_from_gen_curt` and `ch_from_gen_surplus`, not to `ch_from_gen_avail`:**
-- `gen_avail` charging: BESS absorbs generation that *could* have been exported directly at `price[t]`. That foregone export revenue is a real opportunity cost, so the spot term is charged in full.
-- `gen_curt` / `gen_surplus` charging: BESS absorbs generation that would have been wasted this hour regardless (curtailed, or clipped beyond the export connection). No export was ever possible, so there is no real opportunity cost — the spot term is refunded in full. Without this refund, the plain `price[t] × (dsch_mwh[t] − ch_mwh[t])` term would misprice this energy: at a negative price it would fictitiously *credit* the BESS as if it had been paid to import, even though the energy never crossed the meter.
-
-**Term (7) applies only to `ch_from_gen_avail`, not to all of `ch_btm`:**
-- `gen_avail` charging: BESS absorbs generation that *could* have been exported directly. Discharging it later creates no *new* net export — it merely shifts the timing. Discharge tariff refund is warranted.
-- `gen_curt` charging: BESS absorbs generation that would have been curtailed (price too low to export). Discharging it later creates genuinely *new* export that crosses the meter. Discharge tariff applies.
-- `gen_surplus` charging: BESS absorbs clipped generation that *cannot* be exported (connection full). Discharging it later creates genuinely *new* export that crosses the meter. Discharge tariff applies.
-
-`charge_tariff` is replaced by `ctariff[t]` when a per-timestep consumption tariff series is supplied.
-
-**Coded form** (as implemented — `standalone_term` applies always, `colocation_addendum_term` is
-added only in co-location mode, per `profit_rule` in `src/bess_dispatch_opt.py`):
+**O2 — Co-location**: `standalone_term` (O1) applies unconditionally; `colocation_addendum_term`
+is added only in co-location mode (see `profit_rule` in `src/bess_dispatch_opt.py`):
 
 ```
 standalone_term[t]          =  price[t]         × (dsch_mwh[t] − ch_mwh[t])
@@ -352,7 +324,10 @@ max  Σ_t [ standalone_term[t] + colocation_addendum_term[t] ]   (co-location mo
 max  Σ_t   standalone_term[t]                                    (stand-alone mode)
 ```
 
-where `ch_btm[t] = ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t]`. The
-`+ charge_tariff × ch_btm[t]` term refunds the tariff `standalone_term` charged on all of
-`ch_mwh[t]`, leaving only the grid-imported share (`ch_mwh[t] − ch_btm[t] = ch_grid_mwh[t]`) taxed
-— algebraically identical to `− charge_tariff × ch_grid_mwh[t]`.
+`standalone_term` prices and taxes all of `ch_mwh[t]` as if it were grid-imported;
+`colocation_addendum_term` refunds exactly the three BTM treatments already established above —
+`charge_tariff` on the full `ch_btm[t]`, spot price on the `gen_curt`/`gen_surplus` share, and
+`discharge_tariff` on the `gen_avail` share — with `ch_btm[t] = ch_from_gen_avail[t] +
+ch_from_gen_curt[t] + ch_from_gen_surplus[t]`.
+
+`charge_tariff` is replaced by `ctariff[t]` when a per-timestep consumption tariff series is supplied.
