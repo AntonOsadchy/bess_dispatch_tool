@@ -124,14 +124,14 @@ Pyomo decision variables and parameters built from the spec/CSV inputs (see `bui
 |---|---|---|---|---|
 | `price[t]` | Param | from `prices_csv` | all | Spot price (€/MWh) |
 | `ctariff[t]` | Param | from `consumption_tariff_csv` | optional | Per-timestep charge tariff (€/MWh); overrides scalar `charge_tariff` when set |
+| `gen_avail[t]` | Param | `min(generation_mwh[t], export_connection_dt)` | co-location only | Exportable generation available for BTM charging or direct export |
+| `surplus_gen[t]` | Param | `max(0, generation_mwh[t] − export_connection_dt)` | co-location only | Clipped generation beyond export connection capacity; free BTM charging source |
+| `profile_ch_param[t]` / `profile_dsch_param[t]` | Param | from `existing_dispatch_profile_csv`, converted to grid-side via `η_leg` | optional | Pre-committed charge/discharge floor that `ch_mwh[t]` / `dsch_mwh[t]` must meet or exceed |
 | `soc_mwh[t]` | Var | `[0, capacity_mwh]` | all | Battery state of charge at end of timestep |
 | `ch_mwh[t]` | Var | `[0, min(power, grid_import_mw)×dt]` (stand-alone) / `[0, power×dt]` (co-location) | all | Total charging; stand-alone = grid import, co-location = BTM + grid combined |
 | `dsch_mwh[t]` | Var | `[0, min(power, grid_export_mw)×dt]` | all | Grid export (discharge) |
-| `gen_avail[t]` | Param | `min(generation_mwh[t], export_connection_dt)` | co-location only | Exportable generation available for BTM charging or direct export |
-| `surplus_gen[t]` | Param | `max(0, generation_mwh[t] − export_connection_dt)` | co-location only | Clipped generation beyond export connection capacity; free BTM charging source |
 | `ch_grid_mwh[t]` | Var | `[0, grid_import_mw×dt]` (pinned to `max(0, ch_mwh[t] − gen_avail[t] − surplus_gen[t])` by C4/C5) | co-location only | Grid-imported share of charging |
 | `ch_from_gen_avail[t]` | Var | `[0, gen_avail[t]]` (pinned to `min(ch_btm[t], gen_avail[t])` by B5/C6) | co-location only | BTM charging sourced from exportable generation (discharge-tariff-refund-eligible share) |
-| `profile_ch_param[t]` / `profile_dsch_param[t]` | Param | from `existing_dispatch_profile_csv`, converted to grid-side via `η_leg` | optional | Pre-committed charge/discharge floor that `ch_mwh[t]` / `dsch_mwh[t]` must meet or exceed |
 
 Derived (not separate Pyomo variables, computed from the above): `ch_btm[t] = ch_mwh[t] − ch_grid_mwh[t]` — total behind-the-meter charging in a timestep.
 
