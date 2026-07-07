@@ -1,26 +1,32 @@
 # BESS dispatch config — key = value. Full documentation of every key: README.md § "Specification keys".
+output_suffix = _upside_2023
+output_csv = outputs/dispatch_results.csv
 
 prices_csv = inputs/prices_spot_DK2_1h_2023.csv
-output_csv = outputs/dispatch_results.csv
-output_suffix = _upside_2023
+consumption_tariff_csv = inputs/tariffs_consumption_energinet_DK2_1h_2026.csv
+generation_profile_csv = inputs/Egemarke_2023_profile.csv
+#existing_dispatch_profile_csv = inputs/dispatch_results_contracted_2023.csv
+
+grid_import_mw = 0
+grid_export_mw = 90
 
 power = 50
-capacity_mwh = 100
+capacity_mwh = 200
 round_trip_efficiency = 0.9
 #initial_soc = 0.5
+#max_cycles = 365
 
 #charge_tariff = 0
 discharge_tariff = 1.38
 curtailment_price = 0.00
 
-consumption_tariff_csv = inputs/tariffs_consumption_energinet_DK2_1h_2026.csv
-
-grid_import_mw = 0
-grid_export_mw = 90
-
-generation_profile_csv = inputs/Egemarke_2023_profile.csv
 #generation_max_mw = 1
 
-#max_cycles = 365
 
-existing_dispatch_profile_csv = inputs/dispatch_results_contracted_2023.csv
+
+
+
+
+
+
+
