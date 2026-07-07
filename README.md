@@ -102,7 +102,7 @@ Docker Desktop alone is enough.
 
 | Key | Required | Description |
 |---|---|---|
-| `prices_csv` | yes | Path to single-column price CSV (€/MWh, one row per hour); accepts a bracketed list `[a.csv, b.csv]` to run multiple simulations in one go |
+| `prices_csv` | yes | Path to single-column price CSV (€/MWh, one row per hour) |
 | `output_csv` | yes | Path for the output CSV |
 | `output_suffix` | no | String appended to output filenames before the extension (e.g. `_v2` → `dispatch_results_v2.csv`); omit or leave blank for the default name |
 | `power` | yes | Rated AC power (MW) |
@@ -111,14 +111,14 @@ Docker Desktop alone is enough.
 | `initial_soc` | no | Initial state of charge as a fraction of `capacity_mwh` [0–1] (default 0.5) |
 | `charge_tariff` | no | Extra cost per MWh charged at the grid meter (default 0) |
 | `discharge_tariff` | no | Extra cost per MWh discharged at the grid meter (default 0) |
-| `curtailment_price` | no | Price threshold (€/MWh) at or below which co-located generation is treated as curtailed; defaults to `discharge_tariff` when omitted |
-| `max_cycles` | no | Cap on equivalent full cycles over the horizon; comment out to disable |
-| `grid_import_mw` | no | Grid connection import capacity (MW); caps how much the BESS can charge from the grid each timestep |
-| `grid_export_mw` | no | Grid connection export capacity (MW); caps how much the BESS can discharge to the grid each timestep |
+| `curtailment_price` | no | Price threshold (€/MWh) at or below which co-located generation is treated as curtailed; defaults to `discharge_tariff` when omitted. Set explicitly to decouple curtailment reporting from the export tariff. |
+| `max_cycles` | no | Cap on equivalent full cycles over the horizon (constraint C2); comment out to disable |
+| `grid_import_mw` | no | Grid connection import capacity (MW); caps how much the BESS can charge from the grid each timestep. In co-location mode this caps only the grid-imported share — BTM charging from the generator is separate and adds on top, up to the `power` limit (see "Co-location mode"). |
+| `grid_export_mw` | no | Grid connection export capacity (MW); caps how much the BESS can discharge to the grid each timestep. In co-location mode, generation already occupies part of this connection — see constraint C3 under "Co-location mode" for the exact export-headroom formula. |
 | `consumption_tariff_csv` | no | Path to a single-column, headerless per-timestep charge tariff CSV (€/MWh); overrides scalar `charge_tariff` for every timestep when set |
-| `generation_profile_csv` | no | Uncomment to enable co-location mode (single-column, headerless capacity-factor CSV `[0–1]`, one row per timestep) |
+| `generation_profile_csv` | no | Uncomment to enable co-location mode (single-column, headerless capacity-factor CSV `[0–1]`, one row per timestep). See "Co-location mode" for how available generation is computed. |
 | `generation_max_mw` | no* | Nameplate capacity of the co-located generator (MW); required when `generation_profile_csv` is set |
-| `existing_dispatch_profile_csv` | no | Path to a prior run's output CSV (needs `charge_mwh`/`discharge_mwh` columns) that the BESS must honour as a dispatch floor; the optimizer finds additional value on top |
+| `existing_dispatch_profile_csv` | no | Path to a prior run's output CSV that the BESS must honour as a dispatch floor; the optimizer finds additional value on top. See "Existing dispatch profile workflow" below. |
 
 \* Required only when `generation_profile_csv` is active.
 
@@ -127,6 +127,21 @@ Docker Desktop alone is enough.
 `grid_import_mw` bounds `ch_mwh[t]` (grid import) and `grid_export_mw` bounds `dsch_mwh[t]`
 (grid export), each to `grid_*_mw × interval_hours` per timestep. If the BESS rated power
 (`power`) is lower, the tighter of the two limits applies.
+
+### Existing dispatch profile workflow
+
+`existing_dispatch_profile_csv` lets you pre-commit the BESS to a dispatch schedule (e.g. a
+contracted profile, or a prior run's BTM-only result) and have the optimizer add incremental
+value on top using the remaining capacity headroom:
+
+1. Run a first optimisation (e.g. BTM/co-location only) → produces `dispatch_results.csv`.
+2. Set `existing_dispatch_profile_csv` to that output file's path.
+3. Run again — the BESS honours the prior dispatch as a minimum floor at every timestep and
+   optimises additional arbitrage on top (e.g. grid arbitrage layered on a BTM-only base).
+
+The file must be a named-column CSV with at least `charge_mwh` and `discharge_mwh` (stored-side
+MWh per timestep) — matching the column names in this tool's own output CSV, so you can point it
+directly at a prior run's output. The profile length must match the price series.
 
 ## Stand-alone model
 
