@@ -264,8 +264,6 @@ The three BTM terms are pinned by an equality (C6), not just bounded above:
 ```
 ch_btm[t]  =  ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t]
            =  ch_mwh[t] − ch_grid_mwh[t]
-           ≤  gen_avail[t] + gen_curt[t] + gen_surplus[t]
-           =  generation_mwh[t]
 ```
 
 #### Charging sources
