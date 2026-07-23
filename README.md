@@ -103,6 +103,8 @@ Docker Desktop alone is enough.
 | Key | Required | Description |
 |---|---|---|
 | `prices_csv` | yes | Path to single-column price CSV (€/MWh, one row per hour) |
+| `prices_start_date` | no | Calendar date (`YYYY-MM-DD`) of the first row in `prices_csv`, in local time. Used to correctly bucket rows into real local calendar days (handling DST — a spring-forward day has 23 rows, a fall-back day has 25) for the "Average daily price spread" report metric. Without it, day boundaries are assumed at fixed 24-row offsets from row 0, which silently drifts out of sync with real calendar days for months at a time around each DST transition. |
+| `prices_timezone` | no | IANA timezone of `prices_csv` (default `Europe/Copenhagen`); only used together with `prices_start_date` |
 | `output_csv` | yes | Path for the output CSV |
 | `output_suffix` | no | String appended to output filenames before the extension (e.g. `_v2` → `dispatch_results_v2.csv`); omit or leave blank for the default name |
 | `power` | yes | Rated AC power (MW) |

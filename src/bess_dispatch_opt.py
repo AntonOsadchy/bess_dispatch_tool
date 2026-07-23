@@ -149,6 +149,42 @@ def load_prices_csv(path: Path) -> list[float]:
     return s.astype(float).tolist()
 
 
+def average_daily_price_spread(
+    prices: list[float],
+    *,
+    start_date: str | None = None,
+    timezone: str = "Europe/Copenhagen",
+    interval_hours: float = INTERVAL_HOURS,
+) -> float:
+    """Average, over all days in the series, of each day's (max price − min price).
+
+    When start_date is given, rows are mapped to real local calendar dates via a
+    DST-aware datetime index — a spring-forward day has 23 rows and a fall-back day
+    has 25, matching how spot-price data is actually timestamped (e.g. Europe/Copenhagen).
+    Without start_date there is no way to know where calendar-day boundaries fall, so
+    rows are chunked into fixed 24/interval_hours-row blocks from the start of the
+    series instead; this silently drifts out of sync with real calendar days for
+    months at a time around each DST transition, so prefer passing start_date whenever
+    the series' first-row date is known.
+    """
+    if start_date is not None:
+        idx = pd.date_range(
+            start=pd.Timestamp(start_date, tz=timezone),
+            periods=len(prices),
+            freq=pd.Timedelta(hours=interval_hours),
+        )
+        daily = pd.Series(prices, index=idx).groupby(idx.date).agg(lambda s: s.max() - s.min())
+        return float(daily.mean()) if not daily.empty else float("nan")
+
+    steps_per_day = round(24.0 / interval_hours)
+    daily_spreads = [
+        max(day) - min(day)
+        for i in range(0, len(prices), steps_per_day)
+        if (day := prices[i : i + steps_per_day])
+    ]
+    return sum(daily_spreads) / len(daily_spreads) if daily_spreads else float("nan")
+
+
 def load_profile_csv(path: Path, max_mw: float | None = None) -> list[float]:
     """Load a single-column, headerless generation profile CSV.
 
@@ -631,6 +667,12 @@ def main() -> None:
     output_path_base = Path(spec_str(spec, "output_csv"))
     output_suffix = spec_optional_str(spec, "output_suffix") or ""
 
+    # Calendar date of the first price row, used to correctly group rows into real
+    # (DST-aware) local calendar days for the average daily price spread metric below.
+    # Without it, day boundaries are assumed at fixed 24-row offsets from row 0.
+    prices_start_date = spec_optional_str(spec, "prices_start_date")
+    prices_timezone = spec_optional_str(spec, "prices_timezone") or "Europe/Copenhagen"
+
     power_mw = spec_float(spec, "power")
     rte = spec_float(spec, "round_trip_efficiency")
     charge_tariff = spec_float(spec, "charge_tariff", default=0.0)
@@ -844,6 +886,10 @@ def main() -> None:
     report_lines.append(f"  Price mean                           : {sum(prices)/len(prices):>10.2f} €/MWh")
     report_lines.append(f"  Price min                            : {min(prices):>10.2f} €/MWh")
     report_lines.append(f"  Price max                            : {max(prices):>10.2f} €/MWh")
+    avg_daily_spread = average_daily_price_spread(
+        prices, start_date=prices_start_date, timezone=prices_timezone
+    )
+    report_lines.append(f"  Average daily price spread (max-min) : {avg_daily_spread:>10.2f} €/MWh")
     report_lines.append(f"  Hours with negative price            : {sum(1 for p in prices if p < 0):>10d} h")
     if consumption_tariff_csv is not None:
         ct_mean = sum(consumption_tariffs) / len(consumption_tariffs)
