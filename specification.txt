@@ -3,6 +3,10 @@ output_suffix = _upside_2023
 output_csv = outputs/dispatch_results.csv
 
 prices_csv = inputs/prices_spot_DK2_1h_2023.csv
+# Optional separate buy (charging) / sell (discharging) price series, same format as prices_csv.
+# prices_csv fills in whichever side is missing and is the co-location reference price.
+#buy_prices_csv = inputs/prices_buy_DK2_1h_2023.csv
+#sell_prices_csv = inputs/prices_sell_DK2_1h_2023.csv
 consumption_tariff_csv = inputs/tariffs_consumption_energinet_DK2_1h_2026.csv
 generation_profile_csv = inputs/Egemarke_2023_profile.csv
 #existing_dispatch_profile_csv = inputs/dispatch_results_contracted_2023.csv

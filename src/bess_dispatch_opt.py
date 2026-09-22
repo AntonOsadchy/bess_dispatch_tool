@@ -7,7 +7,14 @@ Using the spec value on both legs as η (instead of η_leg) would imply grid-to-
 CSV: grid_import_mwh / grid_export_mwh at the meter; charge_mwh / discharge_mwh are stored-side MWh
 (stored gain = grid_import × η_leg; stored loss to deliver export = grid_export / η_leg), so Δsoc_mwh ≈ charge_mwh − discharge_mwh.
 Each price CSV row is treated as one hour (see INTERVAL_HOURS).
-Optional max equivalent cycles; charge/discharge tariffs apply to grid MWh (same units as prices).
+Optional max equivalent cycles (whole horizon and/or per calendar day); charge/discharge tariffs apply to grid MWh
+(same units as prices). Optional mutual exclusion of charging and discharging within a timestep (binary per timestep).
+
+Buy / sell prices: charging is paid at the buy price (+ charge tariff), discharging earns the sell
+price (− discharge tariff). Spec keys buy_prices_csv / sell_prices_csv supply them; prices_csv is the
+fallback for whichever side is missing and, in co-location mode, the reference price for curtailment,
+generation revenue and the wasted-generation refund (see resolve_prices). A single series (any one of
+the three keys) is used for buy and sell alike.
 
 Grid connection limits (optional, independent):
   grid_import_mw  — limits how much the BESS can draw from the grid each interval.
@@ -45,7 +52,7 @@ Three additional constraints are added in co-location mode:
            Discharging this energy later replaces export that would have happened anyway
            — no new net export is created, so discharge_tariff is EXEMPT.
 
-        b) gen_curt[t] = generation_mwh[t] if price[t] ≤ curtailment_threshold else 0
+        b) gen_curt[t] = generation_mwh[t] if price_curt[t] ≤ curtailment_threshold else 0
            Generation that is fully curtailed for the hour (e.g. negative-price hours) —
            it would not have been exported at all, so there is no export it could displace.
            Discharging BESS energy sourced from it creates NEW export, but the source
@@ -71,11 +78,11 @@ Three additional constraints are added in co-location mode:
       ch_from_gen_surplus get identical (no-refund) tariff treatment, so the LP has no preference
       between them — only their sum matters economically; ch_from_gen_avail is driven to its
       natural value min(ch_btm[t], gen_avail[t]) because, unlike the other two, it earns back
-      discharge_tariff per MWh (except when price[t] is negative enough that grid import itself
+      discharge_tariff per MWh (except when price_buy[t] is negative enough that grid import itself
       becomes more profitable than free BTM charging — see README for the full derivation).
 
-     Objective in co-location mode adds, on top of price[t] × (dsch_mwh[t] − ch_mwh[t]):
-         + price[t] × (ch_from_gen_curt[t] + ch_from_gen_surplus[t])   — spot opportunity-cost
+     Objective in co-location mode adds, on top of price_sell[t] × dsch_mwh[t] − price_buy[t] × ch_mwh[t]:
+         + price_refund[t] × (ch_from_gen_curt[t] + ch_from_gen_surplus[t])   — spot opportunity-cost
              refund: this BTM-charged energy would have been wasted (curtailed or clipped)
              regardless, so — unlike gen_avail-sourced charging, which forgoes real export
              revenue — it has zero true opportunity cost.
@@ -90,6 +97,7 @@ import argparse
 import math
 import random
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -149,14 +157,101 @@ def load_prices_csv(path: Path) -> list[float]:
     return s.astype(float).tolist()
 
 
+@dataclass(frozen=True)
+class PriceSeries:
+    """Per-timestep power prices (€/MWh) as used by the model.
+
+    buy    — paid on charging (grid import), charge tariff is added on top.
+    sell   — earned on discharging (grid export), discharge tariff is deducted.
+    curt   — co-location: price compared against the curtailment threshold and used for
+             generation revenue.
+    refund — co-location: price refunded on charging from curtailed / clipped generation.
+    """
+
+    buy: list[float]
+    sell: list[float]
+    curt: list[float]
+    refund: list[float]
+
+    def __len__(self) -> int:
+        return len(self.buy)
+
+
+def resolve_prices(
+    buy: list[float] | None,
+    sell: list[float] | None,
+    ref: list[float] | None,
+) -> PriceSeries:
+    """Combine the optional buy_prices_csv / sell_prices_csv / prices_csv series.
+
+    A missing buy or sell side falls back to prices_csv, then to the other side, so a single
+    series is used for both. prices_csv (ref) is the co-location reference price for curtailment,
+    generation revenue and the refund; without it curtailment and generation revenue use the sell
+    price and the refund uses the buy price.
+    """
+    given = {
+        name: series
+        for name, series in (
+            ("buy_prices_csv", buy),
+            ("sell_prices_csv", sell),
+            ("prices_csv", ref),
+        )
+        if series is not None
+    }
+    if not given:
+        sys.exit("Specify at least one of prices_csv, buy_prices_csv, sell_prices_csv in specification.txt")
+    if len({len(series) for series in given.values()}) > 1:
+        lengths = ", ".join(f"{name}={len(series)}" for name, series in given.items())
+        sys.exit(f"Price series lengths do not match ({lengths}). Align the CSVs to the same period.")
+
+    def first(*candidates: list[float] | None) -> list[float]:
+        return next(c for c in candidates if c is not None)
+
+    price_buy = first(buy, ref, sell)
+    price_sell = first(sell, ref, buy)
+    return PriceSeries(
+        buy=price_buy,
+        sell=price_sell,
+        curt=first(ref, price_sell),
+        refund=first(ref, price_buy),
+    )
+
+
+def day_labels(
+    n: int,
+    *,
+    start_date: str | None = None,
+    timezone: str = "Europe/Copenhagen",
+    interval_hours: float = INTERVAL_HOURS,
+) -> list[int]:
+    """Consecutive calendar-day index (0, 1, 2, ...) for each of n rows.
+
+    With start_date (a date or a 'YYYY-MM-DD HH:MM' datetime, local time) rows are mapped to real
+    local calendar dates via a DST-aware index, so a spring-forward day has 23 rows and a fall-back
+    day 25. Without it, rows are chunked into fixed 24/interval_hours-row blocks from row 0.
+    """
+    if start_date is not None:
+        idx = pd.date_range(
+            start=pd.Timestamp(start_date, tz=timezone),
+            periods=n,
+            freq=pd.Timedelta(hours=interval_hours),
+        )
+        return pd.factorize(idx.date)[0].tolist()
+    steps_per_day = round(24.0 / interval_hours)
+    return [i // steps_per_day for i in range(n)]
+
+
 def average_daily_price_spread(
-    prices: list[float],
+    sell_prices: list[float],
+    buy_prices: list[float],
     *,
     start_date: str | None = None,
     timezone: str = "Europe/Copenhagen",
     interval_hours: float = INTERVAL_HOURS,
 ) -> float:
-    """Average, over all days in the series, of each day's (max price − min price).
+    """Average, over all days in the series, of each day's (max sell price − min buy price).
+
+    With a single price series (buy == sell) this is the plain daily max − min.
 
     When start_date is given, rows are mapped to real local calendar dates via a
     DST-aware datetime index — a spring-forward day has 23 rows and a fall-back day
@@ -167,22 +262,11 @@ def average_daily_price_spread(
     months at a time around each DST transition, so prefer passing start_date whenever
     the series' first-row date is known.
     """
-    if start_date is not None:
-        idx = pd.date_range(
-            start=pd.Timestamp(start_date, tz=timezone),
-            periods=len(prices),
-            freq=pd.Timedelta(hours=interval_hours),
-        )
-        daily = pd.Series(prices, index=idx).groupby(idx.date).agg(lambda s: s.max() - s.min())
-        return float(daily.mean()) if not daily.empty else float("nan")
-
-    steps_per_day = round(24.0 / interval_hours)
-    daily_spreads = [
-        max(day) - min(day)
-        for i in range(0, len(prices), steps_per_day)
-        if (day := prices[i : i + steps_per_day])
-    ]
-    return sum(daily_spreads) / len(daily_spreads) if daily_spreads else float("nan")
+    labels = day_labels(
+        len(sell_prices), start_date=start_date, timezone=timezone, interval_hours=interval_hours
+    )
+    daily = pd.Series(sell_prices).groupby(labels).max() - pd.Series(buy_prices).groupby(labels).min()
+    return float(daily.mean()) if not daily.empty else float("nan")
 
 
 def load_profile_csv(path: Path, max_mw: float | None = None) -> list[float]:
@@ -247,7 +331,7 @@ def load_existing_profile_csv(path: Path) -> tuple[list[float], list[float]]:
 
 
 def build_and_solve(
-    prices: list[float],
+    prices: PriceSeries,
     *,
     power_mw: float,
     capacity_mwh: float,
@@ -255,6 +339,9 @@ def build_and_solve(
     charge_tariff: float,
     discharge_tariff: float,
     max_cycles: float | None,
+    max_cycles_per_day: float | None = None,
+    day_index: list[int] | None = None,
+    no_simultaneous_charge_discharge: bool = False,
     generation_mwh: list[float] | None = None,
     grid_import_mw: float | None = None,
     grid_export_mw: float | None = None,
@@ -319,7 +406,8 @@ def build_and_solve(
 
     m = pyo.ConcreteModel()
     m.T = pyo.Set(initialize=times)
-    m.price = pyo.Param(m.T, initialize={t: prices[t] for t in times})
+    m.price_buy = pyo.Param(m.T, initialize={t: prices.buy[t] for t in times})
+    m.price_sell = pyo.Param(m.T, initialize={t: prices.sell[t] for t in times})
 
     # Per-timestep consumption tariff: replaces scalar charge_tariff when supplied.
     if consumption_tariffs is not None:
@@ -369,6 +457,34 @@ def build_and_solve(
 
         m.cycle_cap = pyo.Constraint(rule=cycle_cap_rule)  # [C2]
 
+    if max_cycles_per_day is not None:
+        if day_index is None or len(day_index) != T:
+            sys.exit("max_cycles_per_day needs one calendar-day index per timestep")
+        times_by_day: dict[int, list[int]] = {}
+        for t, day in zip(times, day_index):
+            times_by_day.setdefault(day, []).append(t)
+        m.days = pyo.Set(initialize=sorted(times_by_day))
+
+        def daily_cycle_cap_rule(mm, day):
+            return (
+                eta_leg * sum(mm.ch_mwh[t] for t in times_by_day[day])
+                <= max_cycles_per_day * cap
+            )
+
+        m.daily_cycle_cap = pyo.Constraint(m.days, rule=daily_cycle_cap_rule)  # [C2d]
+
+    if no_simultaneous_charge_discharge:
+        # [C6] Charging and discharging are mutually exclusive within a timestep. Needed whenever
+        # price_sell[t] can exceed price_buy[t]: without it the LP charges and discharges at full
+        # power in the same hour and earns the spread on energy that never leaves the battery.
+        m.is_charging = pyo.Var(m.T, domain=pyo.Binary)
+        m.excl_ch = pyo.Constraint(
+            m.T, rule=lambda mm, t: mm.ch_mwh[t] <= max_ch_mwh * mm.is_charging[t]
+        )
+        m.excl_dsch = pyo.Constraint(
+            m.T, rule=lambda mm, t: mm.dsch_mwh[t] <= max_dsch_mwh * (1 - mm.is_charging[t])
+        )
+
     # Co-location constraints.
     if generation_mwh is not None:
         # Export connection reference: grid_export_mw if set, otherwise power_mw.
@@ -376,14 +492,18 @@ def build_and_solve(
             grid_export_mw if grid_export_mw is not None else power_mw
         ) * dt
 
-        # Curtailed generation: fully curtailed (would not be exported at all) whenever the spot
-        # price is at or below curtailment_threshold — e.g. negative-price hours. Falls back to
-        # discharge_tariff when no explicit threshold is supplied, matching main()'s default.
+        # Refund price for charging from curtailed / clipped generation (see colocation_addendum_term).
+        m.price_refund = pyo.Param(m.T, initialize={t: prices.refund[t] for t in times})
+
+        # Curtailed generation: fully curtailed (would not be exported at all) whenever the
+        # curtailment reference price is at or below curtailment_threshold — e.g. negative-price
+        # hours. Falls back to discharge_tariff when no explicit threshold is supplied, matching
+        # main()'s default.
         curt_threshold = (
             curtailment_threshold if curtailment_threshold is not None else discharge_tariff
         )
         gen_curt_param = {
-            t: (generation_mwh[t] if prices[t] <= curt_threshold else 0.0) for t in times
+            t: (generation_mwh[t] if prices.curt[t] <= curt_threshold else 0.0) for t in times
         }
         m.gen_curt = pyo.Param(m.T, initialize=gen_curt_param)
 
@@ -456,10 +576,11 @@ def build_and_solve(
     def standalone_term(mm, t):
         # O1 — stand-alone objective term. Applied unconditionally: in co-location mode this
         # still taxes all of ch_mwh[t] (as if every MWh were grid-taxable) and prices all of it
-        # at spot; colocation_addendum_term below corrects both for the BTM-sourced share.
+        # at the buy price; colocation_addendum_term below corrects both for the BTM-sourced share.
         ct = mm.ctariff[t] if consumption_tariffs is not None else charge_tariff
         return (
-            mm.price[t] * (mm.dsch_mwh[t] - mm.ch_mwh[t])
+            mm.price_sell[t] * mm.dsch_mwh[t]
+            - mm.price_buy[t] * mm.ch_mwh[t]
             - discharge_tariff * mm.dsch_mwh[t]
             - ct * mm.ch_mwh[t]
         )
@@ -468,16 +589,17 @@ def build_and_solve(
         # Co-location addendum on top of standalone_term — added, not substituted:
         #   + ct * ch_btm[t]: refunds charge_tariff on BTM charging (standalone_term taxed all of
         #     ch_mwh[t]; only the grid-imported share ch_grid_mwh[t] should actually be taxed).
-        #   + price[t] * (ch_from_gen_curt + ch_from_gen_surplus): refunds the spot opportunity
-        #     cost standalone_term charged on this share — it would have been wasted (curtailed or
-        #     clipped) regardless, so it has zero true opportunity cost.
+        #   + price_refund[t] * (ch_from_gen_curt + ch_from_gen_surplus): refunds the spot
+        #     opportunity cost standalone_term charged on this share — it would have been wasted
+        #     (curtailed or clipped) regardless, so it has zero true opportunity cost. Cancels the
+        #     buy-price charge exactly only when price_refund == price_buy (single price series).
         #   + discharge_tariff * ch_from_gen_avail: refund for the only BTM source whose later
         #     discharge doesn't create new net export (see B5/C5 discussion above).
         ct = mm.ctariff[t] if consumption_tariffs is not None else charge_tariff
         ch_btm_t = mm.ch_from_gen_avail[t] + mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t]
         return (
             ct * ch_btm_t
-            + mm.price[t] * (mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t])
+            + mm.price_refund[t] * (mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t])
             + discharge_tariff * mm.ch_from_gen_avail[t]
         )
 
@@ -499,7 +621,7 @@ def build_and_solve(
 
 def write_output(
     path: Path,
-    prices: list[float],
+    prices: PriceSeries,
     model: pyo.ConcreteModel,
     *,
     capacity_mwh: float,
@@ -521,7 +643,10 @@ def write_output(
         dsch_stored = dsch_grid / eta_leg
         soc_mwh_val = pyo.value(model.soc_mwh[t])
         soc_frac = soc_mwh_val / capacity_mwh
-        p = prices[t]
+        p_buy = prices.buy[t]
+        p_sell = prices.sell[t]
+        p_curt = prices.curt[t]
+        p_refund = prices.refund[t]
         # Effective charge tariff for this timestep: per-timestep series takes precedence.
         eff_charge_tariff = consumption_tariffs[t] if consumption_tariffs is not None else charge_tariff
 
@@ -533,8 +658,9 @@ def write_output(
             ch_from_gen_curt_t = pyo.value(model.ch_from_gen_curt[t])
             ch_from_gen_surplus_t = pyo.value(model.ch_from_gen_surplus[t])
             revenue = (
-                p * (dsch_grid - ch_total)
-                + p * (ch_from_gen_curt_t + ch_from_gen_surplus_t)
+                p_sell * dsch_grid
+                - p_buy * ch_total
+                + p_refund * (ch_from_gen_curt_t + ch_from_gen_surplus_t)
                 - discharge_tariff * dsch_grid
                 + discharge_tariff * ch_from_gen_avail_t
                 - eff_charge_tariff * ch_grid_taxable
@@ -545,7 +671,8 @@ def write_output(
             ch_btm = 0.0
             ch_from_gen_avail_t = 0.0
             revenue = (
-                p * (dsch_grid - ch_total)
+                p_sell * dsch_grid
+                - p_buy * ch_total
                 - discharge_tariff * dsch_grid
                 - eff_charge_tariff * ch_total
             )
@@ -556,7 +683,7 @@ def write_output(
         if generation_mwh is not None:
             gen_mwh_t = generation_mwh[t]
             threshold = curtailment_threshold
-            curtailed = p <= threshold
+            curtailed = p_curt <= threshold
             gen_gen_curtailed = 0.0 if curtailed else gen_mwh_t
             pv_net_export = max(0.0, gen_gen_curtailed - ch_btm)
             row_generation_mw               = gen_mwh_t / INTERVAL_HOURS
@@ -565,9 +692,9 @@ def write_output(
             row_charge_curtailed_mwh        = ch_from_gen_curt_t
             row_charge_surplus_mwh          = ch_from_gen_surplus_t
             row_generation_mwh              = gen_mwh_t
-            row_generation_rev_uncurtailed  = (p - discharge_tariff) * gen_mwh_t
+            row_generation_rev_uncurtailed  = (p_curt - discharge_tariff) * gen_mwh_t
             row_generation_curtailed_mwh    = gen_gen_curtailed
-            row_generation_rev_curtailed    = 0.0 if curtailed else (p - discharge_tariff) * gen_mwh_t
+            row_generation_rev_curtailed    = 0.0 if curtailed else (p_curt - discharge_tariff) * gen_mwh_t
             row_pv_net_export_mwh           = pv_net_export
             row_total_export_mwh            = pv_net_export + dsch_grid
             row_bess_additional_export_mwh  = row_total_export_mwh - gen_gen_curtailed
@@ -586,7 +713,8 @@ def write_output(
             row_bess_additional_export_mwh  = dsch_grid
 
         row: dict = {
-            "price": p,
+            "price_buy": p_buy,
+            "price_sell": p_sell,
             "soc": soc_frac,
             "soc_mwh": soc_mwh_val,
             # grid_import_mwh: actual meter-crossing import (= ch_grid_taxable in co-loc; ch_total stand-alone)
@@ -653,13 +781,16 @@ def main() -> None:
 
     spec = parse_spec(args.spec)
 
-    prices_csv_raw = spec_str(spec, "prices_csv")
+    # Power prices: any of the three may be given (at least one). See resolve_prices.
+    prices_csv = spec_optional_str(spec, "prices_csv")
+    buy_prices_csv = spec_optional_str(spec, "buy_prices_csv")
+    sell_prices_csv = spec_optional_str(spec, "sell_prices_csv")
 
     if args.write_sample_prices is not None:
         n = args.write_sample_prices
         if n < 1:
             sys.exit("N must be >= 1")
-        out_p = Path(prices_csv_raw)
+        out_p = Path(spec_str(spec, "prices_csv"))
         write_sample_prices(out_p, n, args.sample_seed)
         print(f"Wrote {n} sample prices to {out_p.resolve()}")
         return
@@ -680,6 +811,12 @@ def main() -> None:
     curtailment_price_raw = spec_optional_float(spec, "curtailment_price")
     curtailment_threshold = curtailment_price_raw if curtailment_price_raw is not None else discharge_tariff
     max_cycles = spec_optional_float(spec, "max_cycles")
+    max_cycles_per_day = spec_optional_float(spec, "max_cycles_per_day")
+    no_simultaneous_raw = spec_optional_str(spec, "no_simultaneous_charge_discharge")
+    if no_simultaneous_raw is not None and no_simultaneous_raw.lower() not in (
+        "1", "true", "yes", "0", "false", "no",
+    ):
+        sys.exit("no_simultaneous_charge_discharge must be true or false")
     capacity_mwh = spec_float(spec, "capacity_mwh")
     initial_soc = spec_float(spec, "initial_soc", default=DEFAULT_INITIAL_SOC)
     if not (0 <= initial_soc <= 1):
@@ -719,6 +856,8 @@ def main() -> None:
         sys.exit("grid_export_mw must be >= 0")
     if max_cycles is not None and max_cycles < 0:
         sys.exit("max_cycles must be non-negative")
+    if max_cycles_per_day is not None and max_cycles_per_day < 0:
+        sys.exit("max_cycles_per_day must be non-negative")
 
     if consumption_tariff_csv is not None:
         consumption_tariffs = load_tariff_csv(Path(consumption_tariff_csv))
@@ -728,17 +867,33 @@ def main() -> None:
     if existing_dispatch_profile_csv is not None:
         existing_dispatch_stored = load_existing_profile_csv(Path(existing_dispatch_profile_csv))
 
-    prices_path = Path(prices_csv_raw)
     output_path = output_path_base.parent / (
         output_path_base.stem + output_suffix + output_path_base.suffix
     )
 
-    prices = load_prices_csv(prices_path)
+    prices = resolve_prices(
+        load_prices_csv(Path(buy_prices_csv)) if buy_prices_csv else None,
+        load_prices_csv(Path(sell_prices_csv)) if sell_prices_csv else None,
+        load_prices_csv(Path(prices_csv)) if prices_csv else None,
+    )
+    # Charging and discharging in the same hour is only exploitable when the sell price can exceed the
+    # buy price, so the exclusivity constraint (C6) defaults to on when separate buy/sell series
+    # are supplied and they differ. An explicit spec value always wins.
+    if no_simultaneous_raw is not None:
+        no_simultaneous = no_simultaneous_raw.lower() in ("1", "true", "yes")
+    else:
+        no_simultaneous = (
+            (buy_prices_csv is not None or sell_prices_csv is not None)
+            and prices.buy != prices.sell
+        )
+    # Source file shown in the report for each side (mirrors the fallback in resolve_prices).
+    buy_source = buy_prices_csv or prices_csv or sell_prices_csv
+    sell_source = sell_prices_csv or prices_csv or buy_prices_csv
 
     if consumption_tariffs is not None and len(consumption_tariffs) != len(prices):
         sys.exit(
             f"Consumption tariff series length ({len(consumption_tariffs)}) does not match "
-            f"price series length ({len(prices)}) for {prices_path}. Align the two CSVs to the same period."
+            f"price series length ({len(prices)}). Align the CSVs to the same period."
         )
 
     model, results = build_and_solve(
@@ -749,6 +904,11 @@ def main() -> None:
         charge_tariff=charge_tariff,
         discharge_tariff=discharge_tariff,
         max_cycles=max_cycles,
+        max_cycles_per_day=max_cycles_per_day,
+        day_index=day_labels(len(prices), start_date=prices_start_date, timezone=prices_timezone)
+        if max_cycles_per_day is not None
+        else None,
+        no_simultaneous_charge_discharge=no_simultaneous,
         generation_mwh=generation_mwh,
         grid_import_mw=grid_import_mw,
         grid_export_mw=grid_export_mw,
@@ -783,7 +943,9 @@ def main() -> None:
     total_surplus_charged_mwh: float | None = 0.0 if generation_mwh is not None else None
 
     for t in range(Tn):
-        p        = prices[t]
+        p_buy    = prices.buy[t]
+        p_sell   = prices.sell[t]
+        p_refund = prices.refund[t]
         dsch     = pyo.value(model.dsch_mwh[t])
         ch_total = pyo.value(model.ch_mwh[t])
         eff_ct   = consumption_tariffs[t] if consumption_tariffs is not None else charge_tariff
@@ -806,17 +968,26 @@ def main() -> None:
             ch_from_gen_surplus_t = 0.0
 
         total_export_mwh     += dsch
-        total_export_revenue += p * dsch
+        total_export_revenue += p_sell * dsch
         total_charge_mwh     += ch_total
-        # Charging cost: spot + charge tariff on grid-imported share, plus spot opportunity
-        # cost on gen_avail-sourced BTM share only (generation that could have been exported
-        # at spot price instead). gen_curt/gen_surplus-sourced BTM charging has zero
-        # opportunity cost (would have been wasted regardless), so it is free here.
-        total_charge_cost    += (p + eff_ct) * ch_grid + p * ch_from_gen_avail_t
-        # Discharge profit: spot revenue minus discharge tariff; only gen_avail-sourced BTM
+        # Charging cost: buy price + charge tariff on grid-imported share, plus buy-price
+        # opportunity cost on gen_avail-sourced BTM share only (generation that could have been
+        # exported instead). gen_curt/gen_surplus-sourced BTM charging has zero opportunity cost
+        # (would have been wasted regardless), so its buy-price charge is refunded at p_refund
+        # (== p_buy with a single price series, so it is free here).
+        total_charge_cost    += (
+            (p_buy + eff_ct) * ch_grid
+            + p_buy * ch_from_gen_avail_t
+            + (p_buy - p_refund) * (ch_from_gen_curt_t + ch_from_gen_surplus_t)
+        )
+        # Discharge profit: sell-price revenue minus discharge tariff; only gen_avail-sourced BTM
         # gets the refund (gen_curt/gen_surplus discharge creates new export, so tariff applies).
-        total_dsch_profit    += p * dsch - discharge_tariff * (dsch - ch_from_gen_avail_t)
-        spot_gross           += p * (dsch - ch_total) + p * (ch_from_gen_curt_t + ch_from_gen_surplus_t)
+        total_dsch_profit    += p_sell * dsch - discharge_tariff * (dsch - ch_from_gen_avail_t)
+        spot_gross           += (
+            p_sell * dsch
+            - p_buy * ch_total
+            + p_refund * (ch_from_gen_curt_t + ch_from_gen_surplus_t)
+        )
 
         if generation_mwh is not None:
             tariff_component += (
@@ -881,16 +1052,21 @@ def main() -> None:
 
     # --- Inputs summary ---
     report_lines.append("--- Inputs ---")
-    report_lines.append(f"  Prices CSV                           : {prices_path}")
+    report_lines.append(f"  Buy prices CSV                       : {buy_source}")
+    report_lines.append(f"  Sell prices CSV                      : {sell_source}")
+    if prices_csv is not None and (buy_prices_csv is not None or sell_prices_csv is not None):
+        report_lines.append(f"  Reference prices CSV                 : {prices_csv}")
     report_lines.append(f"  Timesteps                            : {len(prices):>10d} h")
-    report_lines.append(f"  Price mean                           : {sum(prices)/len(prices):>10.2f} €/MWh")
-    report_lines.append(f"  Price min                            : {min(prices):>10.2f} €/MWh")
-    report_lines.append(f"  Price max                            : {max(prices):>10.2f} €/MWh")
+    for side, series in (("Buy", prices.buy), ("Sell", prices.sell)):
+        report_lines.append(f"  {side + ' price mean':<36} : {sum(series)/len(series):>10.2f} €/MWh")
+        report_lines.append(f"  {side + ' price min':<36} : {min(series):>10.2f} €/MWh")
+        report_lines.append(f"  {side + ' price max':<36} : {max(series):>10.2f} €/MWh")
     avg_daily_spread = average_daily_price_spread(
-        prices, start_date=prices_start_date, timezone=prices_timezone
+        prices.sell, prices.buy, start_date=prices_start_date, timezone=prices_timezone
     )
-    report_lines.append(f"  Average daily price spread (max-min) : {avg_daily_spread:>10.2f} €/MWh")
-    report_lines.append(f"  Hours with negative price            : {sum(1 for p in prices if p < 0):>10d} h")
+    report_lines.append(f"  {'Avg daily spread (sell max-buy min)':<36} : {avg_daily_spread:>10.2f} €/MWh")
+    report_lines.append(f"  {'Hours with negative buy price':<36} : {sum(1 for p in prices.buy if p < 0):>10d} h")
+    report_lines.append(f"  {'Hours with negative sell price':<36} : {sum(1 for p in prices.sell if p < 0):>10d} h")
     if consumption_tariff_csv is not None:
         ct_mean = sum(consumption_tariffs) / len(consumption_tariffs)
         ct_min  = min(consumption_tariffs)
@@ -907,6 +1083,8 @@ def main() -> None:
     report_lines.append(f"  Grid import cap                      : {grid_import_mw if grid_import_mw is not None else power_mw:>10.2f} MW")
     report_lines.append(f"  Grid export cap                      : {grid_export_mw if grid_export_mw is not None else power_mw:>10.2f} MW")
     report_lines.append(f"  Max cycles                           : {'unlimited' if max_cycles is None else f'{max_cycles:>6.0f}':>10}")
+    report_lines.append(f"  Max cycles per day                   : {'unlimited' if max_cycles_per_day is None else f'{max_cycles_per_day:>6.1f}':>10}")
+    report_lines.append(f"  No simultaneous charge/discharge     : {('yes' if no_simultaneous else 'no') + (' (default)' if no_simultaneous_raw is None else ''):>10}")
     report_lines.append("")
     if generation_mwh is not None:
         gen_total = sum(generation_mwh)
@@ -969,7 +1147,7 @@ def main() -> None:
         vol_curtailed = 0.0
         rev_curtailed = 0.0
         for t, gen_mwh_t in enumerate(generation_mwh):
-            p = prices[t]
+            p = prices.curt[t]
             vol_uncurtailed += gen_mwh_t
             rev_uncurtailed += (p - discharge_tariff) * gen_mwh_t
             if p > curtailment_threshold:
