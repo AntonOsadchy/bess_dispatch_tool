@@ -349,7 +349,13 @@ def build_and_solve(
     existing_dispatch_stored: tuple[list[float], list[float]] | None = None,
     curtailment_threshold: float | None = None,
     initial_soc: float = DEFAULT_INITIAL_SOC,
-) -> tuple[pyo.ConcreteModel, pyo.SolverResults]:
+    # Only used for the avg_daily_spread_eur_per_mwh standard output metric
+    # below (see average_daily_price_spread) - day boundaries elsewhere in
+    # this function (the max_cycles_per_day constraint) come from the
+    # caller's own day_index instead.
+    prices_start_date: str | None = None,
+    prices_timezone: str = "Europe/Copenhagen",
+) -> tuple[pyo.ConcreteModel, pyo.SolverResults, dict]:
     rte = round_trip_efficiency
     if not (0 < rte <= 1):
         sys.exit("round_trip_efficiency must be in (0, 1]")
@@ -616,7 +622,16 @@ def build_and_solve(
     if not solver.available(False):
         sys.exit("HiGHS solver not available. Install highspy and use Pyomo appsi_highs.")
     results = solver.solve(m)
-    return m, results
+
+    # Standard output metrics, independent of what the battery actually did -
+    # a dict (not a bare float) so more can be added here later without
+    # another breaking change to this return signature.
+    metrics = {
+        "avg_daily_spread_eur_per_mwh": average_daily_price_spread(
+            prices.sell, prices.buy, start_date=prices_start_date, timezone=prices_timezone
+        ),
+    }
+    return m, results, metrics
 
 
 def write_output(
@@ -896,7 +911,7 @@ def main() -> None:
             f"price series length ({len(prices)}). Align the CSVs to the same period."
         )
 
-    model, results = build_and_solve(
+    model, results, metrics = build_and_solve(
         prices,
         power_mw=power_mw,
         capacity_mwh=capacity_mwh,
@@ -916,6 +931,8 @@ def main() -> None:
         existing_dispatch_stored=existing_dispatch_stored,
         curtailment_threshold=curtailment_threshold,
         initial_soc=initial_soc,
+        prices_start_date=prices_start_date,
+        prices_timezone=prices_timezone,
     )
 
     ok = (
@@ -1061,10 +1078,7 @@ def main() -> None:
         report_lines.append(f"  {side + ' price mean':<36} : {sum(series)/len(series):>10.2f} €/MWh")
         report_lines.append(f"  {side + ' price min':<36} : {min(series):>10.2f} €/MWh")
         report_lines.append(f"  {side + ' price max':<36} : {max(series):>10.2f} €/MWh")
-    avg_daily_spread = average_daily_price_spread(
-        prices.sell, prices.buy, start_date=prices_start_date, timezone=prices_timezone
-    )
-    report_lines.append(f"  {'Avg daily spread (sell max-buy min)':<36} : {avg_daily_spread:>10.2f} €/MWh")
+    report_lines.append(f"  {'Avg daily spread (sell max-buy min)':<36} : {metrics['avg_daily_spread_eur_per_mwh']:>10.2f} €/MWh")
     report_lines.append(f"  {'Hours with negative buy price':<36} : {sum(1 for p in prices.buy if p < 0):>10d} h")
     report_lines.append(f"  {'Hours with negative sell price':<36} : {sum(1 for p in prices.sell if p < 0):>10d} h")
     if consumption_tariff_csv is not None:
