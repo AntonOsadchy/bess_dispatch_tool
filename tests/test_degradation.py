@@ -284,7 +284,7 @@ def test_end_to_end_outputs(tmp_path):
         "output_csv": "out.csv", "power": 1, "capacity_mwh": 2, "round_trip_efficiency": 0.9,
         "prices_csv": "p.csv", "endogenous_degradation": "true",
         "degradation_curves_csv": "curves.csv", "discount_rate": 0.07,
-        "terminal_value_per_mwh": 30000, "var_om_per_mwh": 2,
+        "terminal_value_per_mwh": 30000, "var_om_per_mwh": 2, "retirement_years": "off",
     })
     res = run_tool(spec)
     assert res.returncode == 0, res.stderr + res.stdout
@@ -474,6 +474,7 @@ def test_cumulative_end_to_end_outputs(tmp_path):
         "output_csv": "out.csv", "power": 1, "capacity_mwh": 2, "round_trip_efficiency": 0.9,
         "prices_csv": "p.csv", "endogenous_degradation": "true",
         "degradation_curves_csv": "curves.csv", "terminal_value_per_mwh": 30000,
+        "retirement_years": "off",
     })
     res = run_tool(spec)
     assert res.returncode == 0, res.stderr + res.stdout

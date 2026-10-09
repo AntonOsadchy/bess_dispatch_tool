@@ -471,7 +471,7 @@ def load_degradation_curves(path: Path) -> dict[float, list[float]]:
         for rate, sub in df.groupby(df["cycles_per_day"].astype(float)):
             sub = sub.dropna(subset=["value"]).sort_values("year")
             raw[float(rate)] = (sub["year"].astype(int).tolist(), sub["value"].astype(float).tolist())
-    elif "year" in df.columns and len(df.columns) >= 3:
+    elif "year" in df.columns and len(df.columns) >= 2:
         for col in df.columns.drop("year"):
             try:
                 rate = float(col)
@@ -2253,6 +2253,14 @@ def main() -> None:
     lifetime_text = ""
     candidates: list[int] = []
     n_steps = len(prices)
+    if endogenous_degradation and degradation_curves_csv is not None:
+        flat = load_degradation_curves(Path(degradation_curves_csv))
+        if all(v >= 1.0 - 1e-12 for c in flat.values() for v in c):
+            print("Note: the degradation curves show no degradation (SoH 1.0 throughout): running the "
+                  "fixed-capacity model over the full price series.", flush=True)
+            endogenous_degradation = False
+            if retirement_raw is not None:
+                sys.exit("retirement_years needs curves that degrade.")
     if retirement_raw is not None and not endogenous_degradation:
         sys.exit("retirement_years needs degradation curves (degradation_curves_csv)")
     if endogenous_degradation:
@@ -2299,14 +2307,15 @@ def main() -> None:
         elif allow_death:
             lifetime_text = "battery death (MIP, experimental)"
         else:
-            lo, hi = min(lives.values()), min(max(lives.values()), horizon_years)
-            if lo <= hi:
-                candidates = list(range(lo, hi + 1))
-            else:
-                lifetime_text = (
-                    f"must survive the price horizon ({horizon_years} years is shorter than the "
-                    f"fastest curve's {lo}-year life)"
+            lo, hi = min(lives.values()), max(lives.values())
+            if hi > horizon_years:
+                sys.exit(
+                    f"The retirement search runs from the shortest to the longest curve's lifetime "
+                    f"({lo}-{hi} years), but the prices cover only {horizon_years} years. Extend the "
+                    "price series, or set retirement_years (e.g. a list of years within the prices, "
+                    "or off to run the price horizon with the battery required to survive it)."
                 )
+            candidates = list(range(lo, hi + 1))
         too_long = [y for y in candidates if y > horizon_years]
         if too_long:
             sys.exit(

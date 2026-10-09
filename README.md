@@ -428,12 +428,13 @@ profile floors) still applies.
 | Inputs | What runs |
 |---|---|
 | No `degradation_curves_csv` | Fixed capacity over the whole price series: the original model, unchanged (results identical to before). |
-| One curve (one cycling rate, e.g. `year,1`) | SoH follows that curve by age; the run lasts **exactly the curve's lifetime** (later prices are ignored; fewer prices than the lifetime is an error). Average cycling since commissioning is capped at the curve's rate. |
-| Two or more curves (e.g. `year,1,1.25,1.5`) | SoH interpolated between the curves at the average cycles/day since commissioning (`cumulative` method), and a **retirement search** over lifetimes from the fastest to the slowest curve's life (within the price horizon). See "Retirement choice". |
+| Curves with no degradation (SoH 1.0 in every year) | Same as no curve file: fixed capacity over the whole price series. |
+| One curve (one cycling rate, e.g. `year,1`) | SoH follows that curve by age; the run lasts **exactly the curve's lifetime**, i.e. up to its last non-zero year (later prices are ignored; fewer prices than the lifetime is an error). Average cycling since commissioning is capped at the curve's rate. |
+| Two or more curves (e.g. `year,1,1.25,1.5`) | SoH interpolated between the curves at the average cycles/day since commissioning (`cumulative` method), and a **retirement search** over every lifetime from the shortest to the longest curve's life. The prices must cover the longest life (otherwise an error). See "Retirement choice". |
 
-With several curves, `retirement_years` overrides the candidate lifetimes (e.g. `18,21,25`), and
-`retirement_years = off` runs the price horizon with the battery required to survive it. If the prices
-end before the fastest curve's life, the battery cannot die within them and a single run is made.
+With several curves, `retirement_years` overrides the candidate lifetimes (e.g. `18,21,25`, all within
+the prices), and `retirement_years = off` runs the price horizon with the battery required to survive
+it; both also work with prices shorter than the longest curve's life.
 
 ### Additional specification keys
 
@@ -454,7 +455,7 @@ end before the fastest curve's life, the battery cannot die within them and a si
 | `warranty_throughput_mwh` | off | Limit on total cycle-weighted stored throughput over the horizon. |
 | `allow_battery_death` | `false` | **Experimental, does not scale; use `retirement_years`.** `cumulative` method: one yes/no "alive" switch per age year, so the optimiser may let the battery die (capacity 0, no revenue) within the horizon. Makes the model a MIP. See "Battery death". |
 | `mip_rel_gap`, `mip_time_limit_s` | 0.0001, off | Stopping rules for the MIP with `allow_battery_death` (relative gap; time limit in seconds, keeping the best solution found). |
-| `retirement_years` | automatic | Several curves: candidate lifetimes, default every year from the fastest to the slowest curve's life within the price horizon. Override with e.g. `18-20` or `15,18,20`; `off` disables the search. Not allowed with a single curve. See "Retirement choice". |
+| `retirement_years` | automatic | Several curves: candidate lifetimes, default every year from the shortest to the longest curve's life (prices must cover it). Override with e.g. `18-20` or `15,18,20`; `off` disables the search. Not allowed with a single curve. See "Retirement choice". |
 | `solver_method` | `simplex` | HiGHS method (`simplex`, `ipm`, `choose`). See "Solver choice". |
 | `run_crossover` | `on` | Crossover after interior point (`on`, `off`, `choose`); only used with `ipm`. With `off`, a run that does not end optimal is repeated with crossover on. |
 

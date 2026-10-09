@@ -26,20 +26,31 @@ def _run(tmp_path, name, keys):
 def test_curves_switch_degradation_on_without_the_key(tmp_path):
     _prices(tmp_path, 2, peaks=2)
     write_curves(tmp_path / "c.csv", LONG_LIFE)
-    _, report = _run(tmp_path, "auto", {"degradation_curves_csv": "c.csv"})
+    _, report = _run(tmp_path, "auto", {"degradation_curves_csv": "c.csv", "retirement_years": "off"})
     assert "--- Degradation ---" in report and "multi-curve" in report
-    # Prices (2 years) end before the fastest curve's life (6 years): no search, must survive.
     assert "must survive the price horizon" in report
     assert (tmp_path / "auto_periods.csv").is_file()
 
 
-def test_explicit_off_ignores_curves(tmp_path):
-    _prices(tmp_path, 1, peaks=2)
+def test_several_curves_need_prices_up_to_the_longest_life(tmp_path):
+    # Lives 6 / 10 / 15 years: the search needs 15 years of prices, 2 are given.
+    _prices(tmp_path, 2, peaks=2)
     write_curves(tmp_path / "c.csv", LONG_LIFE)
-    _run(tmp_path, "off", {"degradation_curves_csv": "c.csv", "endogenous_degradation": "false"})
+    spec = write_spec(tmp_path / "s.txt", {**BATTERY, "prices_csv": "p.csv", "output_csv": "s.csv",
+                                           "degradation_curves_csv": "c.csv"})
+    res = run_tool(spec)
+    assert res.returncode != 0 and "6-15 years" in res.stderr + res.stdout
+
+
+def test_flat_curve_runs_the_fixed_capacity_model(tmp_path):
+    # A curve with no degradation (SoH 1.0 throughout) runs the original model over all prices.
+    _prices(tmp_path, 2, peaks=2)
+    (tmp_path / "nodeg.csv").write_text("year,1\n0,1\n1,1\n")
+    res, report = _run(tmp_path, "flat", {"degradation_curves_csv": "nodeg.csv"})
     _run(tmp_path, "plain", {})
-    assert not (tmp_path / "off_periods.csv").exists()
-    assert (tmp_path / "off.csv").read_bytes() == (tmp_path / "plain.csv").read_bytes()
+    assert "no degradation" in res.stdout and "--- Degradation ---" not in report
+    assert not (tmp_path / "flat_periods.csv").exists()
+    assert (tmp_path / "flat.csv").read_bytes() == (tmp_path / "plain.csv").read_bytes()
 
 
 def test_zero_discount_rate_changes_nothing(tmp_path):
