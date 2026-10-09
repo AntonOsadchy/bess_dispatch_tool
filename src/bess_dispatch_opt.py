@@ -2316,11 +2316,15 @@ def main() -> None:
 
     if candidates:
         steps_by_year = {y: steps_upto(y) for y in candidates}
-        lifetime_text = (
-            f"retirement search {candidates[0]}-{candidates[-1]} years ({len(candidates)} candidates)"
-            if candidates == list(range(candidates[0], candidates[-1] + 1))
-            else f"retirement search {', '.join(map(str, candidates))} years"
-        )
+        if len(candidates) == 1:
+            lifetime_text = f"fixed {candidates[0]} years (retirement_years)"
+        elif candidates == list(range(candidates[0], candidates[-1] + 1)):
+            lifetime_text = (
+                f"retirement search {candidates[0]}-{candidates[-1]} years "
+                f"({len(candidates)} candidates)"
+            )
+        else:
+            lifetime_text = f"retirement search {', '.join(map(str, candidates))} years"
         print(f"Retirement search: {len(candidates)} candidate lifetimes "
               f"({', '.join(map(str, candidates))} years), one LP each.", flush=True)
         best_years, best_npv = None, None
