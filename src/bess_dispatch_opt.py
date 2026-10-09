@@ -16,6 +16,18 @@ fallback for whichever side is missing and, in co-location mode, the reference p
 generation revenue and the wasted-generation refund (see resolve_prices). A single series (any one of
 the three keys) is used for buy and sell alike.
 
+Degradation (on whenever degradation_curves_csv is given; endogenous_degradation = false switches it
+off): capacity becomes a variable per year (or month) read from SoH curves by battery age. With one
+curve, SoH follows it and the run lasts exactly its lifetime. With curves for several cycling rates,
+SoH is interpolated at the average cycles/day since commissioning and a retirement search (one LP per
+candidate lifetime) picks the lifetime with the highest NPV. Pure LP, HiGHS dual simplex. See
+add_degradation_block and README § "Endogenous degradation".
+
+Discounting (all modes): discount_rate (default 0) discounts each hour's cash flow by its age year.
+
+Inputs can be headerless single-column CSVs or dated CSVs (year,month,day,hour,value); see
+load_timeseries_csv.
+
 Grid connection limits (optional, independent):
   grid_import_mw  — limits how much the BESS can draw from the grid each interval.
   grid_export_mw  — limits how much the BESS can export to the grid each interval.
@@ -94,12 +106,17 @@ Three additional constraints are added in co-location mode:
 from __future__ import annotations
 
 import argparse
+import gc
 import math
+import os
 import random
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
@@ -147,14 +164,73 @@ def spec_str(spec: dict[str, str], key: str) -> str:
     return spec[key]
 
 
-def load_prices_csv(path: Path) -> list[float]:
-    df = pd.read_csv(path, header=None)
-    if df.shape[1] < 1:
-        sys.exit(f"No columns in {path}")
-    s = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
-    if s.empty:
-        sys.exit(f"No numeric prices in {path}")
-    return s.astype(float).tolist()
+def spec_bool(spec: dict[str, str], key: str, default: bool = False) -> bool:
+    val = spec_optional_str(spec, key)
+    if val is None:
+        return default
+    if val.lower() in ("1", "true", "yes"):
+        return True
+    if val.lower() in ("0", "false", "no"):
+        return False
+    sys.exit(f"{key} must be true or false")
+
+
+# Header of a dated time-series CSV: one row per hour, hour = 0-23, hour-beginning, local time.
+DATED_COLUMNS = ["year", "month", "day", "hour", "value"]
+
+
+@dataclass(frozen=True)
+class TimeSeries:
+    """Values of an hourly input series, plus its timestamps when the file was in dated format."""
+
+    values: list[float]
+    index: pd.DatetimeIndex | None  # tz-aware, one per value; None for headerless single-column files
+
+
+def load_timeseries_csv(path: Path, timezone: str, what: str) -> TimeSeries:
+    """Load an hourly input series in either supported format.
+
+    Dated format: header `year,month,day,hour,value`, hour 0-23 (hour-beginning, local time in
+    `timezone`). Rows must form a gap-free hourly sequence; DST is handled as in exchange data:
+    on the autumn change the repeated hour appears twice (in order), on the spring change the
+    skipped hour is absent.
+    Legacy format: headerless single column, one value per row; non-numeric rows are dropped.
+    """
+    with path.open(encoding="utf-8-sig") as f:
+        header = [c.strip().lower() for c in f.readline().strip().split(",")]
+    if header != DATED_COLUMNS:
+        df = pd.read_csv(path, header=None)
+        if df.shape[1] < 1:
+            sys.exit(f"No columns in {path}")
+        s = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
+        if s.empty:
+            sys.exit(f"No numeric {what} in {path}")
+        return TimeSeries(s.astype(float).tolist(), None)
+
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    df.columns = [c.strip().lower() for c in df.columns]
+    if df.empty:
+        sys.exit(f"No rows in {path}")
+    if df[DATED_COLUMNS].isna().any().any():
+        sys.exit(f"{path}: missing values in year/month/day/hour/value")
+    values = pd.to_numeric(df["value"], errors="coerce")
+    if values.isna().any():
+        sys.exit(f"{path}: non-numeric value in row {int(values.isna().idxmax()) + 2}")
+    try:
+        local = pd.DatetimeIndex(pd.to_datetime(df[["year", "month", "day", "hour"]].astype(int)))
+        index = local.tz_localize(timezone, ambiguous="infer", nonexistent="raise")
+    except Exception as e:  # invalid dates, hours outside 0-23, unresolvable DST
+        sys.exit(f"{path}: timestamps are not a valid hourly sequence in {timezone} ({e})")
+    if len(index) > 1:
+        steps = np.diff(index.asi8) / 3.6e12
+        bad = np.flatnonzero(steps != INTERVAL_HOURS)
+        if bad.size:
+            i = int(bad[0])
+            sys.exit(
+                f"{path}: rows {i + 2} and {i + 3} ({local[i]} -> {local[i + 1]}) are not "
+                "consecutive hours. Dated inputs must be a gap-free hourly sequence."
+            )
+    return TimeSeries(values.astype(float).tolist(), index)
 
 
 @dataclass(frozen=True)
@@ -175,6 +251,34 @@ class PriceSeries:
 
     def __len__(self) -> int:
         return len(self.buy)
+
+
+def truncate_prices(prices: PriceSeries, n_steps: int) -> PriceSeries:
+    """The first n_steps hours of a price series."""
+    if n_steps >= len(prices):
+        return prices
+    return PriceSeries(
+        buy=prices.buy[:n_steps], sell=prices.sell[:n_steps],
+        curt=prices.curt[:n_steps], refund=prices.refund[:n_steps],
+    )
+
+
+def parse_year_list(raw: str) -> list[int]:
+    """Parse "18-20" or "15,18,20" (or a mix) into sorted, unique positive whole years."""
+    years: set[int] = set()
+    try:
+        for part in raw.split(","):
+            part = part.strip()
+            if "-" in part:
+                lo, hi = (int(v) for v in part.split("-"))
+                years.update(range(lo, hi + 1))
+            elif part:
+                years.add(int(part))
+    except ValueError:
+        sys.exit(f"retirement_years: expected e.g. 18-20 or 15,18,20 (got '{raw}')")
+    if not years or min(years) < 1:
+        sys.exit(f"retirement_years: need whole years >= 1 (got '{raw}')")
+    return sorted(years)
 
 
 def resolve_prices(
@@ -217,25 +321,40 @@ def resolve_prices(
     )
 
 
+def make_timeline(
+    n: int,
+    start: str | pd.Timestamp,
+    timezone: str = "Europe/Copenhagen",
+    interval_hours: float = INTERVAL_HOURS,
+) -> pd.DatetimeIndex:
+    """DST-aware local timestamps for n consecutive intervals from start.
+
+    start is a tz-aware Timestamp (e.g. the first row of a dated input) or a date /
+    'YYYY-MM-DD HH:MM' string in local time (the prices_start_date spec key).
+    """
+    if isinstance(start, pd.Timestamp) and start.tzinfo is not None:
+        start_ts = start.tz_convert(timezone)
+    else:
+        start_ts = pd.Timestamp(start, tz=timezone)
+    return pd.date_range(start=start_ts, periods=n, freq=pd.Timedelta(hours=interval_hours))
+
+
 def day_labels(
     n: int,
     *,
-    start_date: str | None = None,
+    start_date: str | pd.Timestamp | None = None,
     timezone: str = "Europe/Copenhagen",
     interval_hours: float = INTERVAL_HOURS,
 ) -> list[int]:
     """Consecutive calendar-day index (0, 1, 2, ...) for each of n rows.
 
-    With start_date (a date or a 'YYYY-MM-DD HH:MM' datetime, local time) rows are mapped to real
-    local calendar dates via a DST-aware index, so a spring-forward day has 23 rows and a fall-back
-    day 25. Without it, rows are chunked into fixed 24/interval_hours-row blocks from row 0.
+    With start_date (a date or a 'YYYY-MM-DD HH:MM' datetime, local time, or a tz-aware Timestamp)
+    rows are mapped to real local calendar dates via a DST-aware index, so a spring-forward day has
+    23 rows and a fall-back day 25. Without it, rows are chunked into fixed 24/interval_hours-row
+    blocks from row 0.
     """
     if start_date is not None:
-        idx = pd.date_range(
-            start=pd.Timestamp(start_date, tz=timezone),
-            periods=n,
-            freq=pd.Timedelta(hours=interval_hours),
-        )
+        idx = make_timeline(n, start_date, timezone, interval_hours)
         return pd.factorize(idx.date)[0].tolist()
     steps_per_day = round(24.0 / interval_hours)
     return [i // steps_per_day for i in range(n)]
@@ -245,7 +364,7 @@ def average_daily_price_spread(
     sell_prices: list[float],
     buy_prices: list[float],
     *,
-    start_date: str | None = None,
+    start_date: str | pd.Timestamp | None = None,
     timezone: str = "Europe/Copenhagen",
     interval_hours: float = INTERVAL_HOURS,
 ) -> float:
@@ -269,38 +388,16 @@ def average_daily_price_spread(
     return float(daily.mean()) if not daily.empty else float("nan")
 
 
-def load_profile_csv(path: Path, max_mw: float | None = None) -> list[float]:
-    """Load a single-column, headerless generation profile CSV.
+def scale_generation_profile(values: list[float], max_mw: float | None = None) -> list[float]:
+    """Turn a loaded generation profile into MWh per interval.
 
-    When max_mw is provided the file is treated as capacity factors [0–1]:
-      values are clipped to [0, 1] and scaled → MWh per interval = cf × max_mw × INTERVAL_HOURS.
-    When max_mw is None the scaling step is skipped and each row is used directly as
-      MWh per interval (the CSV must already contain absolute energy values).
+    When max_mw is provided the values are capacity factors [0–1]:
+      clipped to [0, 1] and scaled → MWh per interval = cf × max_mw × INTERVAL_HOURS.
+    When max_mw is None each value is used directly as MWh per interval.
     """
-    df = pd.read_csv(path, header=None)
-    s = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
-    if s.empty:
-        sys.exit(f"No numeric values found in profile CSV: {path}")
-    if max_mw is not None:
-        cf = s.clip(0.0, 1.0).astype(float)
-        return (cf * max_mw * INTERVAL_HOURS).tolist()
-    return s.astype(float).tolist()
-
-
-def load_tariff_csv(path: Path) -> list[float]:
-    """Load a single-column, headerless consumption tariff time-series CSV.
-
-    Each row is the charge tariff in €/MWh for one timestep (same positional layout
-    as the prices CSV).  When this series is supplied it replaces the scalar
-    charge_tariff from the spec for every timestep.
-    """
-    df = pd.read_csv(path, header=None)
-    if df.shape[1] < 1:
-        sys.exit(f"No columns in {path}")
-    s = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
-    if s.empty:
-        sys.exit(f"No numeric tariff values in {path}")
-    return s.astype(float).tolist()
+    if max_mw is None:
+        return list(values)
+    return [min(max(v, 0.0), 1.0) * max_mw * INTERVAL_HOURS for v in values]
 
 
 def load_existing_profile_csv(path: Path) -> tuple[list[float], list[float]]:
@@ -330,6 +427,1060 @@ def load_existing_profile_csv(path: Path) -> tuple[list[float], list[float]]:
     return ch, dsch
 
 
+# ---------------------------------------------------------------------------------------------
+# Endogenous degradation: inputs and preprocessing (see README § "Endogenous degradation")
+# ---------------------------------------------------------------------------------------------
+
+# Largest allowed difference between the curves' final SoH values (fraction of nominal).
+EOL_TOLERANCE = 1e-4
+# Days per age year used to turn cycles/day into cycles per year (band widths, curve points).
+DAYS_PER_YEAR = 365.0
+
+
+def _validate_soh(years: list[int], soh: list[float], what: str) -> list[float]:
+    if years and years[0] == 1:  # age 0 omitted: a new battery is at SoH 1.0
+        years, soh = [0] + years, [1.0] + soh
+    if years != list(range(len(years))) or len(years) < 2:
+        sys.exit(f"{what}: years must be consecutive integers from 0 (got {years[:5]}...)")
+    if abs(soh[0] - 1.0) > 1e-6:
+        sys.exit(f"{what}: value at year 0 must be 1.0 (got {soh[0]})")
+    for y in range(1, len(soh)):
+        if soh[y] > soh[y - 1] + 1e-12:
+            sys.exit(f"{what}: SoH increases between year {y - 1} and {y}")
+    return soh
+
+
+def load_degradation_curves(path: Path) -> dict[float, list[float]]:
+    """Load SoH curves, one per cycling rate (equivalent full cycles per day).
+
+    Two layouts are accepted:
+      long: header `cycles_per_day, year, value`, one row per rate and year;
+      wide: header `year, <rate>, <rate>, ...` (e.g. `year,1,1.25,1.5`), one column per rate,
+            blank once a curve has ended.
+    year = battery age in years (0 = commissioning, value 1.0; a missing year 0 is added), value =
+    state of health as a fraction of nominal energy. Trailing zeros (dead battery) are dropped. One
+    rate gives a fixed SoH path for exactly that curve's lifetime; two or more rates make capacity
+    depend on cycling (interpolated between rates). Each curve runs
+    until end of life, so curves may have different lengths, but they must all end at the same SoH
+    (the end-of-life limit). Returns {rate: [SoH(0), SoH(1), ...]} in ascending rate order.
+    """
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    raw: dict[float, tuple[list[int], list[float]]] = {}
+    if {"cycles_per_day", "year", "value"} <= set(df.columns):
+        for rate, sub in df.groupby(df["cycles_per_day"].astype(float)):
+            sub = sub.dropna(subset=["value"]).sort_values("year")
+            raw[float(rate)] = (sub["year"].astype(int).tolist(), sub["value"].astype(float).tolist())
+    elif "year" in df.columns and len(df.columns) >= 2:
+        for col in df.columns.drop("year"):
+            try:
+                rate = float(col)
+            except ValueError:
+                sys.exit(f"{path}: column '{col}' is not a cycling rate (cycles per day)")
+            sub = df[["year", col]].dropna().sort_values("year")
+            raw[rate] = (sub["year"].astype(int).tolist(), sub[col].astype(float).tolist())
+    else:
+        sys.exit(
+            f"{path}: expected columns cycles_per_day,year,value or year,<rate>,<rate>,... "
+            "(e.g. year,1,1.5,2)"
+        )
+    if not raw or min(raw) <= 0:
+        sys.exit(f"{path}: need at least one curve for a positive cycling rate (got {sorted(raw)})")
+    # A curve may end with 0 to mark that the battery is dead from then on (as in a table that
+    # switches capacity to 0 below end of life). Those zeros are dropped: the curve ends at its last
+    # real value, and past it the model continues with the curve's last yearly loss.
+    for rate, (years, values) in raw.items():
+        while len(values) > 1 and values[-1] <= 0:
+            years.pop()
+            values.pop()
+    curves = {
+        rate: _validate_soh(years, values, f"{path} ({rate:g} cycles/day)")
+        for rate, (years, values) in sorted(raw.items())
+    }
+    ends = {rate: c[-1] for rate, c in curves.items()}
+    if max(ends.values()) - min(ends.values()) > EOL_TOLERANCE:
+        sys.exit(
+            f"{path}: the curves must end at the same SoH, which is used as the end-of-life limit "
+            f"(got {', '.join(f'{v:.4f} at {r:g} cycles/day' for r, v in ends.items())})."
+        )
+    return curves
+
+
+def curves_end_of_life(curves: dict[float, list[float]]) -> float:
+    """End-of-life SoH: the value all curves end at (checked by load_degradation_curves)."""
+    return min(c[-1] for c in curves.values())
+
+
+def load_year_value_csv(path: Path, what: str) -> dict[int, float]:
+    """Load a CSV with header `year, value` into {year: value}."""
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    df.columns = [c.strip().lower() for c in df.columns]
+    if {"year", "value"} - set(df.columns):
+        sys.exit(f"{path}: expected columns year, value for {what}")
+    return dict(zip(df["year"].astype(int), df["value"].astype(float)))
+
+
+def lower_convex_envelope(xs: list[float], ys: list[float]) -> list[float]:
+    """Values at xs (ascending) of the lower convex hull of the points (xs, ys)."""
+    hull: list[tuple[float, float]] = []
+    for x, y in zip(xs, ys):
+        while len(hull) >= 2:
+            (ox, oy), (ax, ay) = hull[-2], hull[-1]
+            if (ax - ox) * (y - oy) - (ay - oy) * (x - ox) <= 0:
+                hull.pop()
+            else:
+                break
+        hull.append((x, y))
+    hx, hy = zip(*hull)
+    return [float(np.interp(x, hx, hy)) for x in xs]
+
+
+@dataclass(frozen=True)
+class YearDegradation:
+    """Degradation parameters for one battery age year, as fractions of nominal energy."""
+
+    calendar: float                  # lost over a full year with no cycling
+    damage: tuple[float, ...]        # lost per equivalent full cycle, one value per band
+    widths: tuple[float, ...]        # band widths in cycles per full age year
+
+
+def derive_degradation_params(
+    curves: dict[float, list[float]],
+    calendar_curve: list[float] | None = None,
+) -> tuple[dict[int, YearDegradation], list[str]]:
+    """Calendar loss and per-cycle damage for each age year from the SoH curves.
+
+    With rates r1 < r2 < ... (cycles/day), Loss[y,r] = SoH_r(y-1) − SoH_r(y); a curve that ends
+    before year y keeps its last-year loss. Calendar[y] comes from the zero-cycling curve when
+    given, otherwise by linear extrapolation through the r1 and r2 points to 0 cycles/day:
+    max(0, Loss[y,r1] − r1·(Loss[y,r2] − Loss[y,r1])/(r2 − r1)) (= 3·Loss[1] − 2·Loss[1.5] for rates
+    1 and 1.5). Band k runs from r(k-1) to r(k) cycles/day (r0 = 0), width 365·(r(k) − r(k-1))
+    cycles per year, and its damage per cycle is the slope between the two points. Non-convex points
+    (damage not non-decreasing) are replaced by their lower convex envelope; negative damage is
+    floored at 0. Returns the parameters and any warnings.
+    """
+    rates = sorted(curves)
+    n_years = max(len(c) for c in curves.values()) - 1
+    if calendar_curve is not None:
+        n_years = min(n_years, len(calendar_curve) - 1)
+
+    def curve_loss(c: list[float], y: int) -> float:
+        return c[y - 1] - c[y] if y < len(c) else c[-2] - c[-1]
+
+    points = [0.0] + list(rates)
+    xs = [DAYS_PER_YEAR * r for r in points]
+    widths = tuple(xs[k + 1] - xs[k] for k in range(len(rates)))
+    params: dict[int, YearDegradation] = {}
+    warnings: list[str] = []
+    repaired: list[int] = []
+    floored: list[int] = []
+    for y in range(1, n_years + 1):
+        loss = [curve_loss(curves[r], y) for r in rates]
+        if calendar_curve is not None:
+            cal = calendar_curve[y - 1] - calendar_curve[y]
+        else:
+            r1, r2 = rates[0], rates[1]
+            cal = max(0.0, loss[0] - r1 * (loss[1] - loss[0]) / (r2 - r1))
+        ys = [cal] + loss
+        slopes = [(ys[k + 1] - ys[k]) / widths[k] for k in range(len(rates))]
+        if any(slopes[k] > slopes[k + 1] + 1e-15 for k in range(len(rates) - 1)):
+            repaired.append(y)
+            ys = lower_convex_envelope(xs, ys)
+            slopes = [(ys[k + 1] - ys[k]) / widths[k] for k in range(len(rates))]
+        if min(slopes) < 0:
+            floored.append(y)
+            slopes = [max(0.0, v) for v in slopes]
+        params[y] = YearDegradation(calendar=ys[0], damage=tuple(slopes), widths=widths)
+
+    def years_text(ys: list[int]) -> str:
+        return f"year {ys[0]}" if len(ys) == 1 else f"{len(ys)} years ({ys[0]}-{ys[-1]})"
+
+    if repaired:
+        warnings.append(
+            f"Damage per cycle is not increasing across bands in {years_text(repaired)}; "
+            "using the lower convex envelope (faster cycling then costs the same per cycle)."
+        )
+    if floored:
+        warnings.append(f"Negative damage per cycle floored at 0 in {years_text(floored)}.")
+    return params, warnings
+
+
+@dataclass(frozen=True)
+class Periods:
+    """Degradation periods. Years are age years from the first timestep (anniversaries), months
+    are months since the first timestep, so 12 months nest exactly in each age year."""
+
+    of_step: list[int]           # period index (0-based) of each timestep
+    start: list[pd.Timestamp]    # local start of each period
+    hours: list[int]             # hours of data in each period
+    age_year: list[int]          # 1-based battery age year of each period
+    year_fraction: list[float]   # hours / hours in that full age year (1 for a full year)
+    calendar_month: list[int]    # calendar month (1-12) the period starts in
+    n_years: float               # horizon length in age years (fractional for a partial year)
+
+
+def build_periods(timeline: pd.DatetimeIndex, freq: str) -> Periods:
+    """Assign each hourly timestep to a degradation period ("year" or "month")."""
+    tz = timeline.tz
+    start = timeline[0]
+    naive_start = start.tz_localize(None)
+    end = timeline[-1] + pd.Timedelta(hours=INTERVAL_HOURS)
+
+    def boundaries(unit: str) -> list[pd.Timestamp]:
+        out = [start]
+        k = 1
+        while out[-1] < end:
+            out.append(
+                (naive_start + pd.DateOffset(**{unit: k})).tz_localize(
+                    tz, ambiguous=True, nonexistent="shift_forward"
+                )
+            )
+            k += 1
+        return out
+
+    year_bounds = boundaries("years")
+    bounds = year_bounds if freq == "year" else boundaries("months")
+    year_ns = np.array([b.value for b in year_bounds])
+    bound_ns = np.array([b.value for b in bounds])
+    of_step = np.searchsorted(bound_ns, timeline.asi8, side="right") - 1
+    n_periods = int(of_step[-1]) + 1
+    hours = np.bincount(of_step, minlength=n_periods)
+    full_year_hours = np.diff(year_ns) / 3.6e12
+    age_year = (np.searchsorted(year_ns, bound_ns[:n_periods], side="right")).tolist()
+    year_fraction = [float(hours[p] / full_year_hours[age_year[p] - 1]) for p in range(n_periods)]
+    year_of_step = np.searchsorted(year_ns, timeline.asi8, side="right")
+    hours_per_year = np.bincount(year_of_step)[1:]
+    n_years = float(sum(hours_per_year[i] / full_year_hours[i] for i in range(len(hours_per_year))))
+    return Periods(
+        of_step=of_step.tolist(),
+        start=[bounds[p] for p in range(n_periods)],
+        hours=hours.tolist(),
+        age_year=age_year,
+        year_fraction=year_fraction,
+        calendar_month=[bounds[p].month for p in range(n_periods)],
+        n_years=n_years,
+    )
+
+
+@dataclass(frozen=True)
+class PeriodDegradation:
+    calendar: list[float]                       # fraction of nominal lost to calendar ageing
+    widths: list[tuple[float, ...]]    # band widths in cycles
+    damage: list[tuple[float, ...]]    # fraction of nominal lost per cycle, per band
+
+
+def period_degradation_params(
+    periods: Periods,
+    yearly: dict[int, YearDegradation],
+    month_multipliers: list[float] | None = None,
+) -> PeriodDegradation:
+    """Scale yearly parameters to periods.
+
+    Calendar loss and band widths scale with the period's share of its age year (hours-based, so
+    DST, leap years and partial first/last periods are exact); damage per cycle is unchanged.
+    month_multipliers (12 values, monthly periods only) scale both calendar loss and damage, e.g.
+    for temperature effects.
+    """
+    max_year = max(periods.age_year)
+    if max_year not in yearly:
+        sys.exit(
+            f"The longest degradation curve covers {max(yearly)} years but the price horizon "
+            f"needs {max_year}."
+        )
+    cal, widths, damage = [], [], []
+    for p, y in enumerate(periods.age_year):
+        f = periods.year_fraction[p]
+        mult = month_multipliers[periods.calendar_month[p] - 1] if month_multipliers else 1.0
+        cal.append(yearly[y].calendar * f * mult)
+        widths.append(tuple(w * f for w in yearly[y].widths))
+        damage.append(tuple(d * mult for d in yearly[y].damage))
+    return PeriodDegradation(calendar=cal, widths=widths, damage=damage)
+
+
+def step_discount_factors(
+    n_steps: int, start: str | pd.Timestamp | None, timezone: str, rate: float, convention: str
+) -> list[float]:
+    """Discount factor of each hourly timestep, by battery age year (anniversaries of the first
+    timestep). Without a start date every 8,760 timesteps count as one year."""
+    if start is not None:
+        periods = build_periods(make_timeline(n_steps, start, timezone), "year")
+        years = [periods.age_year[p] for p in periods.of_step]
+    else:
+        years = [t // 8760 + 1 for t in range(n_steps)]
+    by_year = {y: discount_factor(y, rate, convention) for y in set(years)}
+    return [by_year[y] for y in years]
+
+
+def discount_factor(age_year: float, rate: float, convention: str = "end") -> float:
+    """1/(1+r)^(y−1) for convention "end" (as specified), 1/(1+r)^(y−0.5) for "mid"."""
+    exponent = age_year - (0.5 if convention == "mid" else 1.0)
+    return 1.0 / (1.0 + rate) ** exponent
+
+
+def soh_at_age(curve: list[float], age: float) -> float:
+    """SoH of a yearly curve at a fractional age: linear between years, and past the curve's end
+    continuing with its last-year loss (a curve that ends at 0 stays at 0: the battery is dead)."""
+    last = len(curve) - 1
+    if age <= last:
+        return float(np.interp(age, np.arange(last + 1), curve))
+    if curve[-1] <= 0:
+        return 0.0
+    return curve[-1] - (curve[-2] - curve[-1]) * (age - last)
+
+
+def upper_concave_envelope(xs: list[float], ys: list[float]) -> list[float]:
+    """Values at xs (ascending) of the upper concave hull of the points (xs, ys)."""
+    return [-v for v in lower_convex_envelope(xs, [-y for y in ys])]
+
+
+@dataclass(frozen=True)
+class SohLookup:
+    """Cumulative degradation: SoH at the end of each period as a function of the cycles since
+    commissioning, SoH ≤ c0 + c1·N for every line (c0, c1) of that period (a concave piecewise-
+    linear function of N, so the model stays an LP)."""
+
+    age_end: list[float]                         # battery age in years at the end of each period
+    rate_points: list[float]                     # cycles/day of the lookup points (0 first)
+    soh_points: list[list[float]]                # per period: SoH at each rate point (after repair)
+    raw_points: list[list[float]]                # per period: SoH at each rate point (curves as given)
+    lines: list[list[tuple[float, float]]]       # per period: (c0, c1), N in cycles
+    calendar_soh: list[float]                    # SoH with no cycling at the end of each period
+    max_rate: float                              # highest rate in the curves, cycles/day
+
+    def soh(self, p: int, cycles: float) -> float:
+        return min(c0 + c1 * cycles for c0, c1 in self.lines[p])
+
+    def soh_curves(self, p: int, cycles: float) -> float:
+        """SoH interpolated from the curve points without the concave envelope (for reporting)."""
+        xs = [DAYS_PER_YEAR * self.age_end[p] * r for r in self.rate_points]
+        return float(np.interp(cycles, xs, self.raw_points[p]))
+
+
+def build_single_curve_lookup(
+    curve: list[float], rate: float, periods: Periods
+) -> SohLookup:
+    """Lookup for a single SoH curve: capacity follows the curve by age alone (it does not depend
+    on how the battery is cycled), and the average cycling since commissioning is capped at the
+    curve's rate, which the curve assumes. The horizon must not exceed the curve's lifetime."""
+    life = len(curve) - 1
+    age_end = list(np.cumsum(periods.year_fraction))
+    if age_end[-1] > life + 1e-9:
+        sys.exit(
+            f"The degradation curve covers {life} years but the price horizon needs "
+            f"{age_end[-1]:.2f}; with a single curve the run lasts exactly the curve's lifetime."
+        )
+    soh = [soh_at_age(curve, a) for a in age_end]
+    return SohLookup(
+        age_end=age_end, rate_points=[rate], soh_points=[[v] for v in soh],
+        raw_points=[[v] for v in soh], lines=[[(v, 0.0)] for v in soh], calendar_soh=soh,
+        max_rate=rate,
+    )
+
+
+def build_soh_lookup(
+    curves: dict[float, list[float]],
+    periods: Periods,
+    calendar_curve: list[float] | None = None,
+    extrapolate_below_lowest_rate: bool = True,
+) -> tuple[SohLookup, list[str]]:
+    """Lookup of SoH against cumulative cycles at the end of each period.
+
+    At age a (years since commissioning) a battery that has averaged r cycles/day has done
+    N = 365·a·r cycles, so each curve gives the point (365·a·r_i, SoH_ri(a)). A zero-cycling point
+    comes from the calendar curve, or else by linear extrapolation through the two lowest rates
+    (capped at 1). SoH at any N is the linear interpolation between neighbouring points, i.e. the
+    curve value at the average cycling rate since commissioning. With
+    extrapolate_below_lowest_rate off there is no zero-cycling estimate: below the lowest rate the
+    lowest curve's value is used (curves taken exactly as given). Points are first made
+    non-increasing in N and then replaced by their upper concave envelope where needed.
+    """
+    rates = sorted(curves)
+    n_years = max(len(c) for c in curves.values()) - 1
+    if calendar_curve is not None:
+        n_years = min(n_years, len(calendar_curve) - 1)
+    age_end = list(np.cumsum(periods.year_fraction))
+    if age_end[-1] > n_years + 1e-9:
+        sys.exit(
+            f"The longest degradation curve covers {n_years} years but the price horizon "
+            f"needs {age_end[-1]:.2f}."
+        )
+    # A curve may drop to 0 after its end of life (the battery is dead from then on). It only
+    # informs the zero-cycling extrapolation up to its last non-zero year.
+    life = {
+        r: max(y for y, v in enumerate(c) if v > 0) if c[-1] <= 0 else math.inf
+        for r, c in curves.items()
+    }
+    points = [0.0] + rates
+    soh_points, raw_points, lines, calendar_soh = [], [], [], []
+    repaired: list[int] = []
+    for p, a in enumerate(age_end):
+        s = [soh_at_age(curves[r], a) for r in rates]
+        alive = [r for r in rates if a <= life[r] + 1e-9]
+        if calendar_curve is not None:
+            s0 = soh_at_age(calendar_curve, a)
+        elif not extrapolate_below_lowest_rate:
+            s0 = s[0]
+        elif len(alive) >= 2:
+            r1, r2 = alive[0], alive[1]
+            s1, s2 = soh_at_age(curves[r1], a), soh_at_age(curves[r2], a)
+            s0 = min(1.0, s1 + r1 * (s1 - s2) / (r2 - r1))
+        else:
+            # Fewer than two curves still alive: continue the zero-cycling SoH along its last slope.
+            prev = [1.0] + calendar_soh
+            ages = [0.0] + age_end[:p]
+            slope = (prev[-1] - prev[-2]) / (ages[-1] - ages[-2]) if p >= 2 else 0.0
+            s0 = prev[-1] + slope * (a - ages[-1])
+        if calendar_curve is None and extrapolate_below_lowest_rate and calendar_soh:
+            s0 = min(s0, calendar_soh[-1])       # an estimate, so never let it rise with age
+        ys = [max(s0, s[0])] + s
+        ys = list(np.minimum.accumulate(ys))
+        xs = [DAYS_PER_YEAR * a * r for r in points]
+        env = upper_concave_envelope(xs, ys)
+        if max(abs(e - y) for e, y in zip(env, ys)) > 1e-9 or ys != [max(s0, s[0])] + s:
+            repaired.append(p)
+        segs: list[tuple[float, float]] = []
+        for k in range(len(xs) - 1):
+            c1 = (env[k + 1] - env[k]) / (xs[k + 1] - xs[k])
+            if segs and abs(segs[-1][1] - c1) < 1e-12:
+                continue                              # collinear with the previous segment
+            segs.append((env[k] - c1 * xs[k], c1))
+        soh_points.append(env)
+        raw_points.append([float(y) for y in ys])
+        lines.append(segs)
+        calendar_soh.append(env[0])
+    warnings = []
+    if repaired:
+        warnings.append(
+            f"SoH is not concave/non-increasing in cumulative cycles in {len(repaired)} periods; "
+            "using the upper concave envelope of the curve points."
+        )
+    lookup = SohLookup(
+        age_end=age_end, rate_points=points, soh_points=soh_points, raw_points=raw_points,
+        lines=lines,
+        calendar_soh=calendar_soh, max_rate=rates[-1],
+    )
+    return lookup, warnings
+
+
+@dataclass(frozen=True)
+class DegradationSetup:
+    """Everything build_and_solve needs to add the endogenous degradation block."""
+
+    periods: Periods
+    params: PeriodDegradation | None     # method "period": per-period calendar loss and bands
+    df_step: list[float]          # discount factor of each timestep (of its age year)
+    df_period: list[float]        # discount factor of each period
+    df_end: float                 # discount factor at the end of the horizon (terminal value)
+    a_ch: float = 0.0             # cycle weight on stored charging energy
+    a_dis: float = 1.0            # cycle weight on stored discharging energy
+    soc_min: float = 0.0          # SoC limits as fractions of degraded capacity
+    soc_max: float = 1.0
+    final_soc_fraction: float = 0.0   # SoC[last] >= this × end capacity
+    eol_fraction: float | None = None     # end capacity >= this × nominal (from the curves)
+    terminal_value_per_mwh: float = 0.0
+    var_om_per_mwh: float = 0.0
+    warranty_throughput_mwh: float | None = None
+    lp_power_sharing: bool = False        # LP stand-in for C6 (no binaries)
+    solver_method: str = "simplex"   # fastest reliable choice in tests (see README)
+    run_crossover: str = "on"        # only used with ipm
+    method: str = "period"           # "cumulative" (SoH from cycles since start) or "period"
+    lookup: SohLookup | None = None  # method "cumulative"
+    min_average_rate: float | None = None   # average cycles/day since start >= this while alive
+    allow_death: bool = False        # one binary per age year: the battery may die (MIP)
+    mip_time_limit_s: float | None = None
+    mip_rel_gap: float = 1e-4
+
+
+def add_degradation_block(
+    m: pyo.ConcreteModel,
+    setup: DegradationSetup,
+    *,
+    nominal: float,
+    eta_leg: float,
+    times: list[int],
+    max_ch_mwh: float,
+    max_dsch_mwh: float,
+) -> None:
+    """Capacity as a variable per period, the degradation link (cycle bands and capacity
+    transitions, or the cumulative SoH lookup) and end conditions [C7-C12]. Pure LP unless
+    allow_death adds one binary per age year [C12]."""
+    per, par = setup.periods, setup.params
+    n_periods = len(per.hours)
+    steps: list[list[int]] = [[] for _ in range(n_periods)]
+    for t, p in zip(times, per.of_step):
+        steps[p].append(t)
+
+    m.P = pyo.Set(initialize=range(n_periods))
+    m.Pcap = pyo.Set(initialize=range(n_periods + 1))   # Cap[p] = start of period p, Cap[P] = end
+    m.cap = pyo.Var(m.Pcap, bounds=(0.0, nominal))
+    m.cap[0].fix(nominal)
+
+    # [C12] alive[y] = 1 while the battery operates in age year y; once 0 it stays 0. A dead
+    # battery has no capacity, so the SoC limits (C7) empty it before it dies; only the SoH lookup
+    # needs relaxing, and only where its value could go negative (big-M kept as small as possible
+    # so the relaxation stays tight).
+    if setup.allow_death:
+        m.Y = pyo.Set(initialize=sorted(set(per.age_year)))
+        m.alive = pyo.Var(m.Y, domain=pyo.Binary)
+        m.alive_order = pyo.Constraint(
+            m.Y, rule=lambda mm, y: mm.alive[y + 1] <= mm.alive[y] if y + 1 in mm.Y
+            else pyo.Constraint.Skip,
+        )
+
+    def alive(mm, p):
+        return mm.alive[per.age_year[p]] if setup.allow_death else 1.0
+
+    def dead(mm, p):
+        return 1.0 - mm.alive[per.age_year[p]] if setup.allow_death else 0.0
+
+    # [C7] SoC limited by the period's average degraded capacity (C1 keeps SoC continuous).
+    def avg_cap(mm, t):
+        p = per.of_step[t]
+        return 0.5 * (mm.cap[p] + mm.cap[p + 1])
+
+    m.soc_cap_ub = pyo.Constraint(
+        m.T, rule=lambda mm, t: mm.soc_mwh[t] <= setup.soc_max * avg_cap(mm, t)
+    )
+    if setup.soc_min > 0:
+        m.soc_cap_lb = pyo.Constraint(
+            m.T, rule=lambda mm, t: mm.soc_mwh[t] >= setup.soc_min * avg_cap(mm, t)
+        )
+    if setup.allow_death:
+        # A dead battery neither charges nor discharges.
+        m.dead_no_ch = pyo.Constraint(
+            m.T, rule=lambda mm, t: mm.ch_mwh[t] <= max_ch_mwh * alive(mm, per.of_step[t])
+        )
+        m.dead_no_dsch = pyo.Constraint(
+            m.T, rule=lambda mm, t: mm.dsch_mwh[t] <= max_dsch_mwh * alive(mm, per.of_step[t])
+        )
+        # ... and has no capacity (also removes terminal value).
+        m.dead_cap = pyo.Constraint(
+            m.P, rule=lambda mm, p: mm.cap[p + 1] <= nominal * alive(mm, p)
+        )
+
+    # [C8] Cycle-weighted throughput per period (stored-side energy, same basis as C2).
+    m.throughput = pyo.Expression(
+        m.P,
+        rule=lambda mm, p: sum(
+            setup.a_ch * eta_leg * mm.ch_mwh[t] + setup.a_dis * mm.dsch_mwh[t] / eta_leg
+            for t in steps[p]
+        ),
+    )
+
+    if setup.method == "cumulative":
+        lk = setup.lookup
+        # [C8c] Cycles since commissioning at the end of each period.
+        m.cum_cycles = pyo.Var(m.P, bounds=(0.0, None))
+        m.cum_def = pyo.Constraint(
+            m.P,
+            rule=lambda mm, p: mm.cum_cycles[p] - (mm.cum_cycles[p - 1] if p > 0 else 0.0)
+            - mm.throughput[p] / nominal == 0,
+        )
+        # [C9c] Capacity at the end of a period is at most the curves' SoH at the average cycling
+        # rate since commissioning (concave piecewise-linear lookup: one constraint per segment).
+        m.L = pyo.Set(initialize=[(p, i) for p in range(n_periods) for i in range(len(lk.lines[p]))])
+        # Lowest value each line can take at the highest possible cycle count: a line only needs
+        # relaxing for a dead battery if it can go below 0 (then capacity 0 would be infeasible).
+        n_max = [lk.max_rate * DAYS_PER_YEAR * a for a in lk.age_end]
+        big_m = {
+            (p, i): max(0.0, -(c0 + min(0.0, c1) * n_max[p]))
+            for p in range(n_periods) for i, (c0, c1) in enumerate(lk.lines[p])
+        }
+        m.soh_lookup = pyo.Constraint(
+            m.L,
+            rule=lambda mm, p, i: mm.cap[p + 1] - nominal * lk.lines[p][i][1] * mm.cum_cycles[p]
+            <= nominal * lk.lines[p][i][0] + nominal * big_m[p, i] * dead(mm, p),
+        )
+        m.cap_monotone = pyo.Constraint(m.P, rule=lambda mm, p: mm.cap[p + 1] <= mm.cap[p])
+        # The average cycling rate since commissioning stays within the curves' rates: at most the
+        # highest rate, and (when there is no data below the lowest rate) at least the lowest rate
+        # while the battery is alive.
+        m.avg_rate_max = pyo.Constraint(
+            m.P,
+            rule=lambda mm, p: mm.cum_cycles[p] <= lk.max_rate * DAYS_PER_YEAR * lk.age_end[p],
+        )
+        if setup.min_average_rate is not None:
+            m.avg_rate_min = pyo.Constraint(
+                m.P,
+                rule=lambda mm, p: mm.cum_cycles[p]
+                >= setup.min_average_rate * DAYS_PER_YEAR * lk.age_end[p] * alive(mm, p),
+            )
+    else:
+        # [C8] Cycles split into convex bands.
+        m.K = pyo.Set(initialize=range(len(par.damage[0])))
+        m.band = pyo.Var(m.P, m.K, bounds=lambda mm, p, k: (0.0, par.widths[p][k]))
+        m.band_split = pyo.Constraint(
+            m.P, rule=lambda mm, p: sum(mm.band[p, k] for k in mm.K) == mm.throughput[p] / nominal
+        )
+
+        # [C9] Capacity transition.
+        def transition_rule(mm, p):
+            loss = nominal * (par.calendar[p] + sum(par.damage[p][k] * mm.band[p, k] for k in mm.K))
+            return mm.cap[p + 1] == mm.cap[p] - loss
+
+        m.cap_transition = pyo.Constraint(m.P, rule=transition_rule)
+
+    # [C10] End-of-horizon conditions and optional limits. With allow_death the end-of-life limit
+    # holds at the end of every period the battery is alive in; a year that would end below it
+    # is a dead year.
+    if setup.eol_fraction is not None and setup.allow_death:
+        m.eol_cap = pyo.Constraint(
+            m.P, rule=lambda mm, p: mm.cap[p + 1] >= setup.eol_fraction * nominal * alive(mm, p)
+        )
+    elif setup.eol_fraction is not None:
+        m.eol_cap = pyo.Constraint(expr=m.cap[n_periods] >= setup.eol_fraction * nominal)
+    if setup.final_soc_fraction > 0:
+        m.final_soc = pyo.Constraint(
+            expr=m.soc_mwh[times[-1]] >= setup.final_soc_fraction * m.cap[n_periods]
+        )
+    if setup.warranty_throughput_mwh is not None:
+        m.warranty = pyo.Constraint(
+            expr=sum(m.throughput[p] for p in m.P) <= setup.warranty_throughput_mwh
+        )
+
+    # [C11] LP stand-in for C6: charging and discharging share one power budget in each hour.
+    if setup.lp_power_sharing:
+        m.power_sharing = pyo.Constraint(
+            m.T,
+            rule=lambda mm, t: mm.ch_mwh[t] * max_dsch_mwh + mm.dsch_mwh[t] * max_ch_mwh
+            <= max_ch_mwh * max_dsch_mwh,
+        )
+
+
+def prepare_degradation(
+    spec: dict[str, str],
+    *,
+    n_steps: int,
+    start: str | pd.Timestamp | None,
+    timezone: str,
+    initial_soc: float,
+    lp_power_sharing: bool,
+) -> tuple[DegradationSetup, dict]:
+    """Read the degradation spec keys, preprocess the curves and build the DegradationSetup.
+
+    Returns the setup and a dict of report details (curve file, warnings, rates, conventions).
+    """
+    if start is None:
+        sys.exit(
+            "endogenous_degradation needs real timestamps: use dated inputs "
+            "(year,month,day,hour,value) or set prices_start_date."
+        )
+    freq = (spec_optional_str(spec, "degradation_period") or "year").lower()
+    if freq not in ("year", "month"):
+        sys.exit("degradation_period must be year or month")
+    method = (spec_optional_str(spec, "degradation_method") or "cumulative").lower()
+    if method not in ("cumulative", "period"):
+        sys.exit("degradation_method must be cumulative or period")
+    curves_csv = spec_optional_str(spec, "degradation_curves_csv")
+    if curves_csv is None:
+        sys.exit("endogenous_degradation needs degradation_curves_csv")
+    curves = load_degradation_curves(Path(curves_csv))
+    single = len(curves) == 1
+    if single and method == "period":
+        sys.exit("degradation_method = period needs curves for at least two cycling rates.")
+    eol = curves_end_of_life(curves)
+    if "degradation_curve_fit" in spec:
+        sys.exit(
+            "degradation_curve_fit has been removed: degradation curves are always used as given. "
+            "Remove the key."
+        )
+
+    calendar_csv = spec_optional_str(spec, "calendar_curve_csv")
+    calendar_curve = None
+    if calendar_csv is not None:
+        raw = load_year_value_csv(Path(calendar_csv), "the calendar (zero-cycling) curve")
+        years = sorted(raw)
+        calendar_curve = _validate_soh(years, [raw[y] for y in years], calendar_csv)
+    yearly: dict[int, YearDegradation] = {}
+    warnings: list[str] = []
+    if single and calendar_csv is not None:
+        warnings.append("calendar_curve_csv ignored: with a single curve SoH follows that curve.")
+    if method == "period":
+        yearly, warnings = derive_degradation_params(curves, calendar_curve)
+
+    month_mult_raw = spec_optional_str(spec, "month_degradation_multipliers")
+    month_mult = None
+    if month_mult_raw is not None:
+        month_mult = [float(v) for v in month_mult_raw.split(",")]
+        if len(month_mult) != 12 or min(month_mult) < 0:
+            sys.exit("month_degradation_multipliers needs 12 non-negative comma-separated values")
+        if freq != "month" or method != "period":
+            warnings.append(
+                "month_degradation_multipliers ignored: they need degradation_period = month and "
+                "degradation_method = period."
+            )
+            month_mult = None
+
+    timeline = make_timeline(n_steps, start, timezone)
+    periods = build_periods(timeline, freq)
+    params, lookup = None, None
+    extrapolate_below = spec_bool(spec, "extrapolate_below_lowest_rate", default=False)
+    if method == "period":
+        params = period_degradation_params(periods, yearly, month_mult)
+    elif single:
+        (rate_1, curve_1), = curves.items()
+        lookup = build_single_curve_lookup(curve_1, rate_1, periods)
+    else:
+        lookup, lookup_warnings = build_soh_lookup(
+            curves, periods, calendar_curve, extrapolate_below_lowest_rate=extrapolate_below,
+        )
+        warnings += lookup_warnings
+
+    rate = spec_float(spec, "discount_rate", default=0.0)
+    convention = (spec_optional_str(spec, "discount_convention") or "end").lower()
+    if convention not in ("end", "mid"):
+        sys.exit("discount_convention must be end or mid")
+    if rate <= -1:
+        sys.exit("discount_rate must be > -1")
+    df_period = [discount_factor(y, rate, convention) for y in periods.age_year]
+    df_step = [df_period[p] for p in periods.of_step]
+    df_end = 1.0 / (1.0 + rate) ** periods.n_years
+
+    soc_min = spec_float(spec, "soc_min_fraction", default=0.0)
+    soc_max = spec_float(spec, "soc_max_fraction", default=1.0)
+    if not (0 <= soc_min < soc_max <= 1):
+        sys.exit("soc_min_fraction and soc_max_fraction must satisfy 0 <= min < max <= 1")
+    if not (soc_min <= initial_soc <= soc_max):
+        sys.exit("initial_soc must lie between soc_min_fraction and soc_max_fraction")
+    final_soc = spec_float(spec, "final_soc_fraction", default=initial_soc)
+
+    if "eol_fraction" in spec:
+        sys.exit(
+            "eol_fraction is not a setting: the end-of-life limit is the SoH all degradation "
+            "curves end at. Remove the key."
+        )
+
+    crossover = (spec_optional_str(spec, "run_crossover") or "on").lower()
+    if crossover not in ("on", "off", "choose"):
+        sys.exit("run_crossover must be on, off or choose")
+    allow_death = spec_bool(spec, "allow_battery_death", default=False)
+    if allow_death and method != "cumulative":
+        sys.exit("allow_battery_death needs degradation_method = cumulative")
+    if allow_death and single:
+        sys.exit("allow_battery_death needs curves for at least two cycling rates.")
+    setup = DegradationSetup(
+        periods=periods,
+        params=params,
+        df_step=df_step,
+        df_period=df_period,
+        df_end=df_end,
+        a_ch=spec_float(spec, "cycle_weight_charge", default=0.0),
+        a_dis=spec_float(spec, "cycle_weight_discharge", default=1.0),
+        soc_min=soc_min,
+        soc_max=soc_max,
+        final_soc_fraction=final_soc,
+        eol_fraction=eol,
+        terminal_value_per_mwh=spec_float(spec, "terminal_value_per_mwh", default=0.0),
+        var_om_per_mwh=spec_float(spec, "var_om_per_mwh", default=0.0),
+        warranty_throughput_mwh=spec_optional_float(spec, "warranty_throughput_mwh"),
+        lp_power_sharing=lp_power_sharing,
+        solver_method=(spec_optional_str(spec, "solver_method") or "simplex").lower(),
+        run_crossover=crossover,
+        method=method,
+        lookup=lookup,
+        min_average_rate=(
+            min(curves) if method == "cumulative" and not extrapolate_below and not single else None
+        ),
+        allow_death=allow_death,
+        mip_time_limit_s=spec_optional_float(spec, "mip_time_limit_s"),
+        mip_rel_gap=spec_float(spec, "mip_rel_gap", default=1e-4),
+    )
+    info = {
+        "freq": freq,
+        "method": method,
+        "curves_mode": "single curve" if single else "multi-curve",
+        "curves_csv": curves_csv,
+        "calendar_csv": calendar_csv,
+        "warnings": warnings,
+        "discount_rate": rate,
+        "discount_convention": convention,
+        "eol_fraction": eol,
+        "rates": sorted(curves),
+        "yearly": yearly,
+    }
+    return setup, info
+
+
+def physical_capacity_path(
+    setup: DegradationSetup,
+    cycles: list[float],
+    nominal: float,
+    alive: list[bool] | None = None,
+) -> tuple[list[float], list[list[float]]]:
+    """Capacity path and band split implied by the cycles of each period.
+
+    Method "cumulative": capacity at the end of period p is the lookup SoH at the cycles since
+    commissioning (never rising), with no band split. Method "period": physical loss for a given number of cycles is the cheapest band fill (band 1 first, as damage
+    is non-decreasing across bands). The LP reaches the same split whenever capacity has value to
+    it; when it has none (no terminal value and SoC limits not binding) every split is optimal and
+    the LP's own split can overstate the loss.
+    """
+    if setup.method == "cumulative":
+        caps, total = [nominal], 0.0
+        for p, c in enumerate(cycles):
+            total += max(0.0, c)
+            soh = setup.lookup.soh(p, total) if alive is None or alive[p] else 0.0
+            caps.append(min(caps[-1], nominal * soh))
+        return caps, [[] for _ in cycles]
+    par = setup.params
+    caps = [nominal]
+    bands: list[list[float]] = []
+    for p, c in enumerate(cycles):
+        remaining = max(0.0, c)
+        split = []
+        for width in par.widths[p]:
+            split.append(min(width, remaining))
+            remaining -= split[-1]
+        bands.append(split)
+        loss = nominal * (par.calendar[p] + sum(d * b for d, b in zip(par.damage[p], split)))
+        caps.append(caps[-1] - loss)
+    return caps, bands
+
+
+def degradation_results(
+    model: pyo.ConcreteModel,
+    setup: DegradationSetup,
+    metrics: dict,
+    *,
+    nominal: float,
+    eta_leg: float,
+    timeline: pd.DatetimeIndex,
+) -> tuple[dict[str, list], pd.DataFrame, pd.DataFrame]:
+    """Per-hour extra columns, per-period table and per-age-year table after a degradation solve."""
+    per, par = setup.periods, setup.params
+    n_periods = len(per.hours)
+    lp_cap = [pyo.value(model.cap[p]) for p in range(n_periods + 1)]
+    cycles_by_period = [pyo.value(model.throughput[p]) / nominal for p in range(n_periods)]
+    alive = None
+    if setup.allow_death:
+        alive = [pyo.value(model.alive[per.age_year[p]]) > 0.5 for p in range(n_periods)]
+        # A tie the solver may break either way: trailing periods that are "alive" but idle at the
+        # end-of-life limit earn exactly what a dead battery earns. Report them as dead.
+        for p in reversed(range(n_periods)):
+            if not alive[p]:
+                continue
+            idle = pyo.value(model.throughput[p]) < 1e-6 * nominal
+            at_eol = pyo.value(model.cap[p + 1]) <= (setup.eol_fraction or 0.0) * nominal + 1e-6 * nominal
+            if not (alive[p] and idle and at_eol):
+                break
+            alive[p] = False
+    cap, band_split = physical_capacity_path(setup, cycles_by_period, nominal, alive)
+    gap = max(abs(a - b) for a, b in zip(cap, lp_cap))
+    if gap > 1e-6 * nominal:
+        print(
+            f"Note: the optimiser's capacity variables are up to {gap:.4f} MWh below the physical "
+            "path because capacity had no value to it in some periods (no terminal value and SoC "
+            "limits not binding). Reported capacity follows the physical path.",
+            flush=True,
+        )
+    times = range(len(per.of_step))
+    op_cash = [pyo.value(model.op_cash[t]) for t in times]
+    dsch = [pyo.value(model.dsch_mwh[t]) for t in times]
+
+    hourly = {
+        "timestamp": [ts.strftime("%Y-%m-%d %H:%M%z") for ts in timeline],
+        "period": [p + 1 for p in per.of_step],
+        "age_year": [per.age_year[p] for p in per.of_step],
+        "capacity_mwh_period": [0.5 * (cap[p] + cap[p + 1]) for p in per.of_step],
+        "discount_factor": setup.df_step,
+    }
+
+    rows = []
+    cumulative = 0.0
+    for p in range(n_periods):
+        throughput = pyo.value(model.throughput[p])
+        cycles = cycles_by_period[p]
+        value = metrics["capacity_value"][p]
+        if setup.method == "cumulative":
+            lk = setup.lookup
+            cumulative += cycles
+            cal_start = lk.calendar_soh[p - 1] if p > 0 else 1.0
+            is_alive = alive is None or alive[p]
+            calendar_loss = nominal * (cal_start - lk.calendar_soh[p]) if is_alive else 0.0
+            death_loss = 0.0 if is_alive else cap[p] - cap[p + 1]
+            rows.append({
+                "period": p + 1,
+                "start": per.start[p].strftime("%Y-%m-%d %H:%M%z"),
+                "hours": per.hours[p],
+                "age_year": per.age_year[p],
+                "alive": is_alive,
+                "age_end_years": lk.age_end[p],
+                "capacity_start_mwh": cap[p],
+                "capacity_end_mwh": cap[p + 1],
+                # Same lookup without the concave envelope: differs where the curves are not
+                # concave in cumulative cycles (see the warning).
+                "capacity_end_curves_mwh": nominal * lk.soh_curves(p, cumulative),
+                "throughput_mwh": throughput,
+                "cycles": cycles,
+                "cycles_per_day": cycles / (per.hours[p] / 24.0),
+                "cumulative_cycles": cumulative,
+                "avg_cycles_per_day_since_start": cumulative / (DAYS_PER_YEAR * lk.age_end[p]),
+                "calendar_loss_mwh": calendar_loss,
+                "cycle_loss_mwh": cap[p] - cap[p + 1] - calendar_loss - death_loss,
+                "death_loss_mwh": death_loss,
+                "discount_factor": setup.df_period[p],
+                "capacity_value_pv_eur_per_mwh": value,
+                # € (in period p money) per MWh of cycle-weighted throughput in period p: the NPV
+                # lost because every later capacity limit tightens.
+                "deg_cost_eur_per_mwh": metrics["degradation_cost_pv"][p] / setup.df_period[p],
+            })
+            continue
+        bands = band_split[p]
+        cycle_loss = nominal * sum(d * b for d, b in zip(par.damage[p], bands))
+        row = {
+            "period": p + 1,
+            "start": per.start[p].strftime("%Y-%m-%d %H:%M%z"),
+            "hours": per.hours[p],
+            "age_year": per.age_year[p],
+            "capacity_start_mwh": cap[p],
+            "capacity_end_mwh": cap[p + 1],
+            "throughput_mwh": throughput,
+            "cycles": cycles,
+            "cycles_per_day": cycles / (per.hours[p] / 24.0),
+            **{f"cycles_band{k + 1}": b for k, b in enumerate(bands)},
+            "calendar_loss_mwh": nominal * par.calendar[p],
+            "cycle_loss_mwh": cycle_loss,
+            "discount_factor": setup.df_period[p],
+            "capacity_value_pv_eur_per_mwh": value,
+        }
+        # DegCost[p,k] = value of capacity × damage per cycle ÷ DF: € (in period p money) per MWh of
+        # cycle-weighted throughput, since one cycle is `nominal` MWh and costs nominal·damage MWh.
+        for k, d in enumerate(par.damage[p]):
+            row[f"deg_cost_band{k + 1}_eur_per_mwh"] = value * d / setup.df_period[p]
+        rows.append(row)
+    periods_df = pd.DataFrame(rows)
+
+    yearly = pd.DataFrame(
+        {
+            "age_year": [per.age_year[p] for p in per.of_step],
+            "operating_cash_eur": op_cash,
+            "var_om_eur": [setup.var_om_per_mwh * d for d in dsch],
+            "discount_factor": setup.df_step,
+        }
+    )
+    yearly["net_eur"] = yearly["operating_cash_eur"] - yearly["var_om_eur"]
+    yearly["net_discounted_eur"] = yearly["net_eur"] * yearly["discount_factor"]
+    yearly_df = (
+        yearly.groupby("age_year")
+        .agg(
+            operating_cash_eur=("operating_cash_eur", "sum"),
+            var_om_eur=("var_om_eur", "sum"),
+            net_eur=("net_eur", "sum"),
+            discount_factor=("discount_factor", "first"),
+            net_discounted_eur=("net_discounted_eur", "sum"),
+        )
+        .reset_index()
+    )
+    return hourly, periods_df, yearly_df
+
+
+def resolve_timeline(
+    dated_inputs: dict[str, pd.DatetimeIndex | None],
+    prices_start_date: str | None,
+    timezone: str,
+) -> pd.DatetimeIndex | None:
+    """Common timestamps of the dated inputs (None if every input is in legacy format).
+
+    All dated inputs must have identical timestamps; prices_start_date, if also given, must equal
+    the first timestamp.
+    """
+    dated = {key: idx for key, idx in dated_inputs.items() if idx is not None}
+    if not dated:
+        return None
+    (ref_key, ref), *others = dated.items()
+    for key, idx in others:
+        if len(idx) != len(ref) or not (idx == ref).all():
+            i = next(
+                (i for i in range(min(len(idx), len(ref))) if idx[i] != ref[i]),
+                min(len(idx), len(ref)),
+            )
+            sys.exit(
+                f"{key} and {ref_key} have different timestamps (first difference at row {i + 2}). "
+                "Dated inputs must cover exactly the same hours."
+            )
+    if prices_start_date is not None:
+        spec_start = make_timeline(1, prices_start_date, timezone)[0]
+        if spec_start != ref[0]:
+            sys.exit(
+                f"prices_start_date ({spec_start}) does not match the first timestamp of the "
+                f"dated inputs ({ref[0]}). Remove prices_start_date or correct it."
+            )
+    return ref
+
+
+def solve_lp(m: pyo.ConcreteModel, method: str, crossover: str, dual_cons: list) -> dict:
+    """Solve a pure LP with HiGHS (default dual simplex) and return the duals of dual_cons.
+
+    The model must be a minimisation: with crossover off this HiGHS build reports status
+    "Unknown" and flips dual signs on maximisation problems, but handles minimisation correctly.
+    If the run without crossover is not optimal it is repeated with crossover on.
+    """
+    from pyomo.contrib.appsi.base import TerminationCondition as AppsiTC
+    from pyomo.contrib.appsi.solvers import Highs
+
+    opt = Highs()
+    if not opt.available():
+        sys.exit("HiGHS solver not available. Install highspy.")
+    opt.config.load_solution = False
+    attempts = [crossover] if (method != "ipm" or crossover == "on") else [crossover, "on"]
+    for attempt in attempts:
+        opt.highs_options = {"solver": method, "run_crossover": attempt}
+        res = opt.solve(m)
+        if res.termination_condition == AppsiTC.optimal:
+            break
+        if attempt != attempts[-1]:
+            print(
+                f"Note: HiGHS {method} without crossover ended '{res.termination_condition.name}'; "
+                "retrying with crossover on.",
+                flush=True,
+            )
+    else:
+        hint = ""
+        if "infeasible" in res.termination_condition.name.lower():
+            hint = (
+                " The end-of-life limit (the SoH the curves end at) may be unreachable over this "
+                "horizon, e.g. if calendar loss alone takes capacity below it."
+            )
+        sys.exit(f"Solver did not finish optimally: termination={res.termination_condition.name}.{hint}")
+    opt.load_vars()
+    return opt.get_duals(dual_cons)
+
+
+def solve_mip(m: pyo.ConcreteModel, setup: DegradationSetup) -> dict:
+    """Solve the model with its alive binaries as a MIP (HiGHS branch and bound).
+
+    Stops at mip_rel_gap or mip_time_limit_s; a time-limited run keeps the best solution found.
+    Returns {"seconds", "gap", "time_limited"}.
+    """
+    from pyomo.contrib.appsi.base import TerminationCondition as AppsiTC
+    from pyomo.contrib.appsi.solvers import Highs
+
+    opt = Highs()
+    if not opt.available():
+        sys.exit("HiGHS solver not available. Install highspy.")
+    opt.config.load_solution = False
+    opt.highs_options = {"mip_rel_gap": setup.mip_rel_gap}
+    opt.config.stream_solver = os.environ.get("BESS_SOLVER_LOG") == "1"
+    if os.environ.get("BESS_SOLVER_LOG_FILE"):
+        # HiGHS writes this file itself as it goes, so progress survives a killed run.
+        opt.highs_options["log_file"] = os.environ["BESS_SOLVER_LOG_FILE"]
+    if setup.mip_time_limit_s is not None:
+        opt.config.time_limit = setup.mip_time_limit_s
+    start = time.time()
+    res = opt.solve(m)
+    elapsed = time.time() - start
+    time_limited = res.termination_condition == AppsiTC.maxTimeLimit
+    has_solution = res.best_feasible_objective is not None and math.isfinite(res.best_feasible_objective)
+    if not (res.termination_condition == AppsiTC.optimal or (time_limited and has_solution)):
+        sys.exit(f"MIP did not finish: termination={res.termination_condition.name}.")
+    opt.load_vars()
+    best, bound = res.best_feasible_objective, res.best_objective_bound
+    gap = abs(best - bound) / max(1e-9, abs(best)) if bound is not None and math.isfinite(bound) else float("nan")
+    if time_limited:
+        print(f"Note: MIP stopped at the time limit; best solution kept (gap {gap * 100:.3f} %).", flush=True)
+    return {"seconds": elapsed, "gap": gap, "time_limited": time_limited}
+
+
 def build_and_solve(
     prices: PriceSeries,
     *,
@@ -353,8 +1504,14 @@ def build_and_solve(
     # below (see average_daily_price_spread) - day boundaries elsewhere in
     # this function (the max_cycles_per_day constraint) come from the
     # caller's own day_index instead.
-    prices_start_date: str | None = None,
+    prices_start_date: str | pd.Timestamp | None = None,
     prices_timezone: str = "Europe/Copenhagen",
+    # Endogenous degradation (None = fixed capacity, the original model). When set, the model is
+    # a pure LP solved with HiGHS and C6 must be off.
+    degradation: DegradationSetup | None = None,
+    # Fixed-capacity model only: discount factor of each timestep (None = undiscounted, the
+    # original objective). With degradation the factors come from the DegradationSetup.
+    discount_factors: list[float] | None = None,
 ) -> tuple[pyo.ConcreteModel, pyo.SolverResults, dict]:
     rte = round_trip_efficiency
     if not (0 < rte <= 1):
@@ -616,13 +1773,6 @@ def build_and_solve(
             )
         return sum(standalone_term(mm, t) for t in times)
 
-    m.obj = pyo.Objective(rule=profit_rule, sense=pyo.maximize)
-
-    solver = pyo.SolverFactory("appsi_highs")
-    if not solver.available(False):
-        sys.exit("HiGHS solver not available. Install highspy and use Pyomo appsi_highs.")
-    results = solver.solve(m)
-
     # Standard output metrics, independent of what the battery actually did -
     # a dict (not a bare float) so more can be added here later without
     # another breaking change to this return signature.
@@ -631,6 +1781,88 @@ def build_and_solve(
             prices.sell, prices.buy, start_date=prices_start_date, timezone=prices_timezone
         ),
     }
+
+    if degradation is None:
+        if discount_factors is None:
+            m.obj = pyo.Objective(rule=profit_rule, sense=pyo.maximize)
+        else:
+            if len(discount_factors) != T:
+                sys.exit("discount_factors must have one value per timestep")
+            # [O4] Discounted fixed-capacity objective: each hour's cash flow times its age year's
+            # discount factor. m.op_cash keeps the undiscounted terms for reporting.
+            m.op_cash = pyo.Expression(
+                m.T,
+                rule=lambda mm, t: standalone_term(mm, t)
+                + (colocation_addendum_term(mm, t) if generation_mwh is not None else 0.0),
+            )
+            m.npv = pyo.Expression(expr=sum(discount_factors[t] * m.op_cash[t] for t in times))
+            m.obj = pyo.Objective(expr=m.npv, sense=pyo.maximize)
+
+        solver = pyo.SolverFactory("appsi_highs")
+        if not solver.available(False):
+            sys.exit("HiGHS solver not available. Install highspy and use Pyomo appsi_highs.")
+        results = solver.solve(m)
+        return m, results, metrics
+
+    if no_simultaneous_charge_discharge:
+        sys.exit("Endogenous degradation keeps the model a pure LP: C6 (binary) cannot be on.")
+    setup = degradation
+    if setup.allow_death and existing_dispatch_stored is not None:
+        sys.exit("allow_battery_death cannot be combined with an existing dispatch profile.")
+    add_degradation_block(
+        m, setup, nominal=cap, eta_leg=eta_leg, times=times,
+        max_ch_mwh=max_ch_mwh, max_dsch_mwh=max_dsch_mwh,
+    )
+    # [O3] Hourly operating cash flow is exactly the fixed-capacity objective term (tariffs and
+    # co-location included); it is discounted by the age year's factor, net of variable O&M.
+    m.op_cash = pyo.Expression(
+        m.T,
+        rule=lambda mm, t: standalone_term(mm, t)
+        + (colocation_addendum_term(mm, t) if generation_mwh is not None else 0.0),
+    )
+    n_periods = len(setup.periods.hours)
+    npv = sum(
+        setup.df_step[t] * (m.op_cash[t] - setup.var_om_per_mwh * m.dsch_mwh[t]) for t in times
+    ) + setup.df_end * setup.terminal_value_per_mwh * m.cap[n_periods]
+    m.npv = pyo.Expression(expr=npv)
+    # Minimise −NPV rather than maximise NPV: see solve_lp.
+    m.obj = pyo.Objective(expr=-m.npv, sense=pyo.minimize)
+
+    if setup.allow_death:
+        # [C12] Choose the death year with branch and bound, then fix it and re-solve as an LP so
+        # the duals (capacity value, degradation cost) are available as in the pure-LP case.
+        metrics["mip"] = solve_mip(m, setup)
+        for y in m.Y:
+            v = round(pyo.value(m.alive[y]))
+            m.alive[y].domain = pyo.Reals
+            m.alive[y].fix(v)
+        start = time.time()
+
+    # For a minimisation the dual is d(objective)/d(rhs) = −d(NPV)/d(rhs).
+    if setup.method == "cumulative":
+        cons = [m.soh_lookup[k] for k in m.L] + [m.cum_def[p] for p in m.P]
+        duals = solve_lp(m, setup.solver_method, setup.run_crossover, cons)
+        # Loosening every lookup line of period p by 1 MWh = 1 MWh more capacity at its end.
+        metrics["capacity_value"] = [
+            -sum(duals[m.soh_lookup[p, i]] for i in range(len(setup.lookup.lines[p]))) for p in m.P
+        ]
+        # Raising the rhs of cum_def[p] by 1 adds one cycle to the count from period p on without
+        # any revenue: the NPV lost per cycle, divided by nominal, is the PV cost per MWh.
+        metrics["degradation_cost_pv"] = [duals[m.cum_def[p]] / cap for p in m.P]
+        if setup.allow_death:
+            metrics["mip"]["lp_seconds"] = time.time() - start
+    else:
+        duals = solve_lp(
+            m, setup.solver_method, setup.run_crossover, [m.cap_transition[p] for p in m.P]
+        )
+        # Adding 1 MWh to Cap[p+1] raises the NPV by −dual, so the present value of 1 MWh of
+        # capacity at the end of period p is −dual.
+        metrics["capacity_value"] = [-duals[m.cap_transition[p]] for p in m.P]
+    results = SimpleNamespace(
+        solver=SimpleNamespace(
+            status=SolverStatus.ok, termination_condition=TerminationCondition.optimal
+        )
+    )
     return m, results, metrics
 
 
@@ -647,7 +1879,9 @@ def write_output(
     generation_mwh: list[float] | None = None,
     consumption_tariffs: list[float] | None = None,
     existing_dispatch_stored: tuple[list[float], list[float]] | None = None,
+    extra_columns: dict[str, list] | None = None,
 ) -> None:
+    """extra_columns: additional per-timestep columns (e.g. degradation period, capacity)."""
     eta_leg = math.sqrt(round_trip_efficiency)
     rows = []
     cumulative_revenue = 0.0
@@ -757,6 +1991,9 @@ def write_output(
             "profile_charge_mwh": existing_dispatch_stored[0][t] if existing_dispatch_stored is not None else 0.0,
             "profile_discharge_mwh": existing_dispatch_stored[1][t] if existing_dispatch_stored is not None else 0.0,
         }
+        if extra_columns:
+            for name, values in extra_columns.items():
+                row[name] = values[t]
         rows.append(row)
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(path, index=False)
@@ -818,6 +2055,20 @@ def main() -> None:
     # Without it, day boundaries are assumed at fixed 24-row offsets from row 0.
     prices_start_date = spec_optional_str(spec, "prices_start_date")
     prices_timezone = spec_optional_str(spec, "prices_timezone") or "Europe/Copenhagen"
+    # Degradation runs whenever a degradation curve file is given; endogenous_degradation can still
+    # switch it off (false) explicitly.
+    degradation_curves_csv = spec_optional_str(spec, "degradation_curves_csv")
+    if spec_optional_str(spec, "endogenous_degradation") is not None:
+        endogenous_degradation = spec_bool(spec, "endogenous_degradation")
+    else:
+        endogenous_degradation = degradation_curves_csv is not None
+    # Discounting (all modes): 0 by default, i.e. undiscounted cash flows.
+    discount_rate = spec_float(spec, "discount_rate", default=0.0)
+    discount_convention = (spec_optional_str(spec, "discount_convention") or "end").lower()
+    if discount_rate <= -1:
+        sys.exit("discount_rate must be > -1")
+    if discount_convention not in ("end", "mid"):
+        sys.exit("discount_convention must be end or mid")
 
     power_mw = spec_float(spec, "power")
     rte = spec_float(spec, "round_trip_efficiency")
@@ -847,6 +2098,9 @@ def main() -> None:
     consumption_tariff_csv = spec_optional_str(spec, "consumption_tariff_csv")
     consumption_tariffs: list[float] | None = None
 
+    # Timestamps of every input given in dated (year,month,day,hour,value) format; all must agree.
+    dated_inputs: dict[str, pd.DatetimeIndex | None] = {}
+
     # Co-location: enabled by uncommenting generation_profile_csv in the spec.
     # generation_max_mw is optional: when set the profile is treated as capacity factors
     # [0–1] and scaled accordingly; when omitted the CSV values are used as-is (MWh/interval).
@@ -859,7 +2113,9 @@ def main() -> None:
             gen_max_mw = float(gen_max_mw_raw)
             if gen_max_mw <= 0:
                 sys.exit("generation_max_mw must be positive")
-        generation_mwh = load_profile_csv(Path(gen_profile_csv), gen_max_mw)
+        gen_series = load_timeseries_csv(Path(gen_profile_csv), prices_timezone, "generation values")
+        dated_inputs["generation_profile_csv"] = gen_series.index
+        generation_mwh = scale_generation_profile(gen_series.values, gen_max_mw)
 
     if power_mw <= 0:
         sys.exit("power must be positive")
@@ -875,7 +2131,9 @@ def main() -> None:
         sys.exit("max_cycles_per_day must be non-negative")
 
     if consumption_tariff_csv is not None:
-        consumption_tariffs = load_tariff_csv(Path(consumption_tariff_csv))
+        tariff_series = load_timeseries_csv(Path(consumption_tariff_csv), prices_timezone, "tariff values")
+        dated_inputs["consumption_tariff_csv"] = tariff_series.index
+        consumption_tariffs = tariff_series.values
 
     existing_dispatch_profile_csv = spec_optional_str(spec, "existing_dispatch_profile_csv")
     existing_dispatch_stored: tuple[list[float], list[float]] | None = None
@@ -886,21 +2144,46 @@ def main() -> None:
         output_path_base.stem + output_suffix + output_path_base.suffix
     )
 
+    def load_price_input(key: str, path: str | None) -> list[float] | None:
+        if path is None:
+            return None
+        series = load_timeseries_csv(Path(path), prices_timezone, "prices")
+        dated_inputs[key] = series.index
+        return series.values
+
     prices = resolve_prices(
-        load_prices_csv(Path(buy_prices_csv)) if buy_prices_csv else None,
-        load_prices_csv(Path(sell_prices_csv)) if sell_prices_csv else None,
-        load_prices_csv(Path(prices_csv)) if prices_csv else None,
+        load_price_input("buy_prices_csv", buy_prices_csv),
+        load_price_input("sell_prices_csv", sell_prices_csv),
+        load_price_input("prices_csv", prices_csv),
     )
+    timeline = resolve_timeline(dated_inputs, prices_start_date, prices_timezone)
+    if timeline is not None:
+        # Dated inputs define the start; day buckets and degradation periods follow from it.
+        prices_start_date = timeline[0]
+
     # Charging and discharging in the same hour is only exploitable when the sell price can exceed the
     # buy price, so the exclusivity constraint (C6) defaults to on when separate buy/sell series
     # are supplied and they differ. An explicit spec value always wins.
+    # With endogenous degradation the model must stay a pure LP, so the binary C6 is replaced by its
+    # LP stand-in C11 (shared power budget) under the same default rule.
+    exclusivity_default = (
+        (buy_prices_csv is not None or sell_prices_csv is not None)
+        and prices.buy != prices.sell
+    )
     if no_simultaneous_raw is not None:
         no_simultaneous = no_simultaneous_raw.lower() in ("1", "true", "yes")
     else:
-        no_simultaneous = (
-            (buy_prices_csv is not None or sell_prices_csv is not None)
-            and prices.buy != prices.sell
-        )
+        no_simultaneous = exclusivity_default
+    lp_power_sharing = False
+    if endogenous_degradation:
+        if no_simultaneous_raw is not None and no_simultaneous:
+            sys.exit(
+                "no_simultaneous_charge_discharge = true needs binary variables, which endogenous "
+                "degradation does not allow. Remove the key: separate buy/sell prices then get the "
+                "LP power-sharing constraint instead."
+            )
+        lp_power_sharing = no_simultaneous
+        no_simultaneous = False
     # Source file shown in the report for each side (mirrors the fallback in resolve_prices).
     buy_source = buy_prices_csv or prices_csv or sell_prices_csv
     sell_source = sell_prices_csv or prices_csv or buy_prices_csv
@@ -911,29 +2194,194 @@ def main() -> None:
             f"price series length ({len(prices)}). Align the CSVs to the same period."
         )
 
-    model, results, metrics = build_and_solve(
-        prices,
-        power_mw=power_mw,
-        capacity_mwh=capacity_mwh,
-        round_trip_efficiency=rte,
-        charge_tariff=charge_tariff,
-        discharge_tariff=discharge_tariff,
-        max_cycles=max_cycles,
-        max_cycles_per_day=max_cycles_per_day,
-        day_index=day_labels(len(prices), start_date=prices_start_date, timezone=prices_timezone)
-        if max_cycles_per_day is not None
-        else None,
-        no_simultaneous_charge_discharge=no_simultaneous,
-        generation_mwh=generation_mwh,
-        grid_import_mw=grid_import_mw,
-        grid_export_mw=grid_export_mw,
-        consumption_tariffs=consumption_tariffs,
-        existing_dispatch_stored=existing_dispatch_stored,
-        curtailment_threshold=curtailment_threshold,
-        initial_soc=initial_soc,
-        prices_start_date=prices_start_date,
-        prices_timezone=prices_timezone,
-    )
+    def solve_horizon(n_steps: int, show_warnings: bool = True):
+        """Prepare degradation (if on) and solve over the first n_steps hours."""
+        setup, info = None, {}
+        if endogenous_degradation:
+            setup, info = prepare_degradation(
+                spec,
+                n_steps=n_steps,
+                start=prices_start_date,
+                timezone=prices_timezone,
+                initial_soc=initial_soc,
+                lp_power_sharing=lp_power_sharing,
+            )
+            if show_warnings:
+                for warning in info["warnings"]:
+                    print(f"Warning: {warning}", flush=True)
+        cut = lambda xs: None if xs is None else xs[:n_steps]
+        out = build_and_solve(
+            truncate_prices(prices, n_steps),
+            power_mw=power_mw,
+            capacity_mwh=capacity_mwh,
+            round_trip_efficiency=rte,
+            charge_tariff=charge_tariff,
+            discharge_tariff=discharge_tariff,
+            max_cycles=max_cycles,
+            max_cycles_per_day=max_cycles_per_day,
+            day_index=day_labels(n_steps, start_date=prices_start_date, timezone=prices_timezone)
+            if max_cycles_per_day is not None
+            else None,
+            no_simultaneous_charge_discharge=no_simultaneous,
+            generation_mwh=cut(generation_mwh),
+            grid_import_mw=grid_import_mw,
+            grid_export_mw=grid_export_mw,
+            consumption_tariffs=cut(consumption_tariffs),
+            existing_dispatch_stored=None if existing_dispatch_stored is None
+            else (existing_dispatch_stored[0][:n_steps], existing_dispatch_stored[1][:n_steps]),
+            curtailment_threshold=curtailment_threshold,
+            initial_soc=initial_soc,
+            prices_start_date=prices_start_date,
+            prices_timezone=prices_timezone,
+            degradation=setup,
+            discount_factors=step_discount_factors(
+                n_steps, prices_start_date, prices_timezone, discount_rate, discount_convention
+            ) if setup is None and discount_rate != 0 else None,
+        )
+        return setup, info, out
+
+    # How long the battery runs, decided by the curves given:
+    #   no curves        -> fixed capacity over the price horizon (the original model);
+    #   one curve        -> capacity follows that curve; the run lasts exactly its lifetime;
+    #   two or more      -> capacity interpolated between the curves at the average cycling rate, and
+    #                       a retirement search over lifetimes from the fastest to the slowest
+    #                       curve's life (within the price horizon): one LP per candidate operating
+    #                       life, at or above end of life at its end, nothing afterwards; the
+    #                       candidate with the highest NPV is kept (the shorter one on a tie).
+    retirement_raw = spec_optional_str(spec, "retirement_years")
+    retirement_table: list[tuple[int, float, float]] = []   # (years, NPV, end capacity)
+    lifetime_text = ""
+    candidates: list[int] = []
+    n_steps = len(prices)
+    if endogenous_degradation and degradation_curves_csv is not None:
+        flat = load_degradation_curves(Path(degradation_curves_csv))
+        if all(v >= 1.0 - 1e-12 for c in flat.values() for v in c):
+            print("Note: the degradation curves show no degradation (SoH 1.0 throughout): running the "
+                  "fixed-capacity model over the full price series.", flush=True)
+            endogenous_degradation = False
+            if retirement_raw is not None:
+                sys.exit("retirement_years needs curves that degrade.")
+    if retirement_raw is not None and not endogenous_degradation:
+        sys.exit("retirement_years needs degradation curves (degradation_curves_csv)")
+    if endogenous_degradation:
+        if prices_start_date is None:
+            sys.exit(
+                "Degradation needs real timestamps: use dated inputs (year,month,day,hour,value) "
+                "or set prices_start_date."
+            )
+        if degradation_curves_csv is None:
+            sys.exit("endogenous_degradation needs degradation_curves_csv")
+        curves_in = load_degradation_curves(Path(degradation_curves_csv))
+        lives = {r: len(c) - 1 for r, c in curves_in.items()}
+        years_full = build_periods(
+            make_timeline(len(prices), prices_start_date, prices_timezone), "year"
+        )
+        year_of_step = [years_full.age_year[p] for p in years_full.of_step]
+        horizon_years = max(year_of_step)
+
+        def steps_upto(years: int) -> int:
+            return sum(1 for a in year_of_step if a <= years)
+
+        allow_death = spec_bool(spec, "allow_battery_death", default=False)
+        if len(curves_in) == 1:
+            if retirement_raw is not None:
+                sys.exit("retirement_years needs curves for at least two cycling rates: a single "
+                         "curve fixes the lifetime.")
+            (rate_1, life), = lives.items()
+            if life > horizon_years:
+                sys.exit(
+                    f"The degradation curve covers {life} years but the prices cover only "
+                    f"{horizon_years}; with a single curve the run lasts exactly the curve's lifetime."
+                )
+            n_steps = steps_upto(life)
+            lifetime_text = f"single curve, fixed {life} years"
+            if n_steps < len(prices):
+                print(f"Note: single degradation curve: running its {life}-year lifetime; later "
+                      "prices are not used.", flush=True)
+        elif retirement_raw is not None and retirement_raw.lower() in ("off", "none", "no", "false"):
+            lifetime_text = "must survive the price horizon"
+        elif retirement_raw is not None:
+            if allow_death:
+                sys.exit("Use either retirement_years or allow_battery_death, not both.")
+            candidates = parse_year_list(retirement_raw)
+        elif allow_death:
+            lifetime_text = "battery death (MIP, experimental)"
+        else:
+            lo, hi = min(lives.values()), max(lives.values())
+            if hi > horizon_years:
+                sys.exit(
+                    f"The retirement search runs from the shortest to the longest curve's lifetime "
+                    f"({lo}-{hi} years), but the prices cover only {horizon_years} years. Extend the "
+                    "price series, or set retirement_years (e.g. a list of years within the prices, "
+                    "or off to run the price horizon with the battery required to survive it)."
+                )
+            candidates = list(range(lo, hi + 1))
+        too_long = [y for y in candidates if y > horizon_years]
+        if too_long:
+            sys.exit(
+                f"retirement_years {too_long} exceed the price horizon ({horizon_years} age years); "
+                "extend the price series or drop them."
+            )
+
+    if candidates:
+        steps_by_year = {y: steps_upto(y) for y in candidates}
+        if len(candidates) == 1:
+            lifetime_text = f"fixed {candidates[0]} years (retirement_years)"
+        elif candidates == list(range(candidates[0], candidates[-1] + 1)):
+            lifetime_text = (
+                f"retirement search {candidates[0]}-{candidates[-1]} years "
+                f"({len(candidates)} candidates)"
+            )
+        else:
+            lifetime_text = f"retirement search {', '.join(map(str, candidates))} years"
+        print(f"Retirement search: {len(candidates)} candidate lifetimes "
+              f"({', '.join(map(str, candidates))} years), one LP each.", flush=True)
+        best_years, best_npv = None, None
+        kept = None      # only the last solved candidate is kept in memory
+        for i, years in enumerate(candidates):
+            kept = None
+            gc.collect()
+            start_time = time.time()
+            print(f"Retirement candidate: {years} years ...", flush=True)
+            setup_y, info_y, out_y = solve_horizon(steps_by_year[years], show_warnings=i == 0)
+            npv_y = pyo.value(out_y[0].npv)
+            end_cap_y = pyo.value(out_y[0].cap[len(setup_y.periods.hours)])
+            print(
+                f"  {years} years: NPV {npv_y:,.0f} €, LP end capacity {end_cap_y:.3f} MWh "
+                f"({time.time() - start_time:.0f} s)",
+                flush=True,
+            )
+            retirement_table.append((years, npv_y, end_cap_y))
+            if best_npv is None or npv_y > best_npv + 1e-7 * max(1.0, abs(best_npv)):
+                best_years, best_npv = years, npv_y
+            kept = (years, setup_y, info_y, out_y)
+            del setup_y, info_y, out_y
+        if kept[0] != best_years:
+            # The winner was solved earlier and released to save memory: solve it again.
+            kept = None
+            gc.collect()
+            print(f"Re-solving the chosen lifetime ({best_years} years) ...", flush=True)
+            kept = (best_years, *solve_horizon(steps_by_year[best_years], show_warnings=False))
+        _, degradation_setup, degradation_info, (model, results, metrics) = kept
+        kept = None
+        n_steps = steps_by_year[best_years]
+        degradation_info["retirement_years"] = best_years
+    else:
+        degradation_setup, degradation_info, (model, results, metrics) = solve_horizon(n_steps)
+    if degradation_setup is not None:
+        degradation_info["lifetime_mode"] = lifetime_text or "must survive the price horizon"
+
+    # Everything below reports the chosen operating life only.
+    if n_steps < len(prices):
+        prices = truncate_prices(prices, n_steps)
+        if generation_mwh is not None:
+            generation_mwh = generation_mwh[:n_steps]
+        if consumption_tariffs is not None:
+            consumption_tariffs = consumption_tariffs[:n_steps]
+        if existing_dispatch_stored is not None:
+            existing_dispatch_stored = (
+                existing_dispatch_stored[0][:n_steps], existing_dispatch_stored[1][:n_steps]
+            )
 
     ok = (
         results.solver.status == SolverStatus.ok
@@ -945,7 +2393,12 @@ def main() -> None:
             f"termination={results.solver.termination_condition}"
         )
 
-    total_profit = pyo.value(model.obj)
+    if degradation_setup is None and discount_rate == 0:
+        total_profit = pyo.value(model.obj)
+    else:
+        # Undiscounted operating profit, comparable with the fixed-capacity model; the NPV
+        # (the objective) is reported in the degradation section.
+        total_profit = sum(pyo.value(model.op_cash[t]) for t in range(len(prices)))
     Tn = len(prices)
 
     # Single pass over all timesteps — compute all summary stats together.
@@ -1048,6 +2501,19 @@ def main() -> None:
     # Profit normalised to 365 cycles: total profit divided by 365.
     profit_365_cycles_normalized = total_profit / 365.0
 
+    hourly_extra: dict[str, list] | None = None
+    periods_df: pd.DataFrame | None = None
+    yearly_df: pd.DataFrame | None = None
+    if degradation_setup is not None:
+        hourly_extra, periods_df, yearly_df = degradation_results(
+            model,
+            degradation_setup,
+            metrics,
+            nominal=capacity_mwh,
+            eta_leg=math.sqrt(rte),
+            timeline=make_timeline(len(prices), prices_start_date, prices_timezone),
+        )
+
     write_output(
         output_path,
         prices,
@@ -1060,7 +2526,13 @@ def main() -> None:
         generation_mwh=generation_mwh,
         consumption_tariffs=consumption_tariffs,
         existing_dispatch_stored=existing_dispatch_stored,
+        extra_columns=hourly_extra,
     )
+    periods_path = output_path.with_name(output_path.stem + "_periods.csv")
+    yearly_path = output_path.with_name(output_path.stem + "_yearly.csv")
+    if periods_df is not None:
+        periods_df.to_csv(periods_path, index=False)
+        yearly_df.to_csv(yearly_path, index=False)
 
     # -------------------------------------------------------------------------
     # Build report lines (written to terminal and .txt file)
@@ -1098,7 +2570,11 @@ def main() -> None:
     report_lines.append(f"  Grid export cap                      : {grid_export_mw if grid_export_mw is not None else power_mw:>10.2f} MW")
     report_lines.append(f"  Max cycles                           : {'unlimited' if max_cycles is None else f'{max_cycles:>6.0f}':>10}")
     report_lines.append(f"  Max cycles per day                   : {'unlimited' if max_cycles_per_day is None else f'{max_cycles_per_day:>6.1f}':>10}")
-    report_lines.append(f"  No simultaneous charge/discharge     : {('yes' if no_simultaneous else 'no') + (' (default)' if no_simultaneous_raw is None else ''):>10}")
+    if degradation_setup is not None:
+        sharing = "LP power-sharing" if lp_power_sharing else "no"
+        report_lines.append(f"  No simultaneous charge/discharge     : {sharing + (' (default)' if no_simultaneous_raw is None else ''):>10}")
+    else:
+        report_lines.append(f"  No simultaneous charge/discharge     : {('yes' if no_simultaneous else 'no') + (' (default)' if no_simultaneous_raw is None else ''):>10}")
     report_lines.append("")
     if generation_mwh is not None:
         gen_total = sum(generation_mwh)
@@ -1128,6 +2604,9 @@ def main() -> None:
     report_lines.append(f"  Spot revenue (gross, before tariffs) : {spot_gross:>10.2f} €")
     report_lines.append(f"  Tariff charges                       : {tariff_component:>10.2f} €")
     report_lines.append(f"  Total profit                         : {total_profit:>10.2f} €")
+    if degradation_setup is None and discount_rate != 0:
+        report_lines.append(f"  Discount rate                        : {discount_rate*100:>10.2f} % ({discount_convention}-year)")
+        report_lines.append(f"  NPV (discounted profit)              : {pyo.value(model.npv):>10.2f} €")
     report_lines.append(f"  Charging volume                      : {total_charge_mwh:>10.2f} MWh")
     if math.isnan(weighted_avg_charge_cost):
         report_lines.append("  Weighted avg charging cost           :        n/a  €/MWh")
@@ -1153,6 +2632,69 @@ def main() -> None:
     report_lines.append(f"  Profit / 365 cycles per MW           : {profit_365_cycles_normalized / power_mw:>10.2f} €/cycle/MW")
     report_lines.append(f"  BESS curtailment reduction           : {curtailment_reduction_mwh:>10.2f} MWh")
     report_lines.append(f"  BESS charged from surplus generation : {total_surplus_charged_mwh if total_surplus_charged_mwh is not None else 0.0:>10.2f} MWh")
+
+    if degradation_setup is not None:
+        ds, info = degradation_setup, degradation_info
+        npv = pyo.value(model.npv)
+        end_cap = periods_df["capacity_end_mwh"].iloc[-1]
+        total_cycles = periods_df["cycles"].sum()
+        total_days = sum(ds.periods.hours) / 24.0
+        simultaneous = sum(
+            1
+            for t in range(Tn)
+            if pyo.value(model.ch_mwh[t]) > 1e-6 and pyo.value(model.dsch_mwh[t]) > 1e-6
+        )
+        report_lines.append("")
+        report_lines.append("--- Degradation ---")
+        report_lines.append(f"  Degradation curves CSV               : {info['curves_csv']}")
+        report_lines.append(f"  Calendar curve CSV                   : {info['calendar_csv'] or 'extrapolated'}")
+        report_lines.append(f"  Cycling rates in curves              : {', '.join(f'{r:g}' for r in sorted(info['rates']))} per day")
+        report_lines.append(f"  Degradation curves mode              : {info['curves_mode']:>10}")
+        report_lines.append(f"  Lifetime                             : {info['lifetime_mode']}")
+        report_lines.append(f"  Degradation method                   : {info['method']:>10}")
+        report_lines.append(f"  Degradation period                   : {info['freq']:>10}")
+        report_lines.append(f"  Periods                              : {len(ds.periods.hours):>10d}")
+        report_lines.append(f"  Horizon                              : {ds.periods.n_years:>10.2f} years")
+        report_lines.append(f"  Discount rate                        : {info['discount_rate']*100:>10.2f} % ({info['discount_convention']}-year)")
+        report_lines.append(f"  Cycle weights charge / discharge     : {ds.a_ch:>4.2f} / {ds.a_dis:.2f}")
+        report_lines.append(f"  Start capacity                       : {capacity_mwh:>10.2f} MWh")
+        report_lines.append(f"  End capacity                         : {end_cap:>10.2f} MWh")
+        report_lines.append(f"  End capacity (share of nominal)      : {end_cap / capacity_mwh * 100:>10.1f} %")
+        if ds.method == "cumulative":
+            curves_end = periods_df["capacity_end_curves_mwh"].iloc[-1]
+            report_lines.append(f"  End capacity, curves w/o envelope    : {curves_end:>10.2f} MWh")
+        report_lines.append(f"  Calendar loss                        : {periods_df['calendar_loss_mwh'].sum():>10.2f} MWh")
+        report_lines.append(f"  Cycle loss                           : {periods_df['cycle_loss_mwh'].sum():>10.2f} MWh")
+        report_lines.append(f"  End-of-life limit (from curves)      : {info['eol_fraction'] * capacity_mwh:>10.2f} MWh")
+        report_lines.append(f"  Degradation-weighted cycles          : {total_cycles:>10.2f} cycles")
+        report_lines.append(f"  Average cycles per day               : {total_cycles / total_days:>10.3f}")
+        report_lines.append(f"  Variable O&M (undiscounted)          : {yearly_df['var_om_eur'].sum():>10.2f} €")
+        report_lines.append(f"  Terminal value (discounted)          : {ds.df_end * ds.terminal_value_per_mwh * end_cap:>10.2f} €")
+        report_lines.append(f"  NPV (objective)                      : {npv:>10.2f} €")
+        if ds.allow_death:
+            alive_years = sorted({r.age_year for r in periods_df.itertuples() if r.alive})
+            last_alive = alive_years[-1] if alive_years else 0
+            death_text = (
+                "survives the horizon" if periods_df["alive"].all()
+                else f"dies after year {last_alive}"
+            )
+            mip = metrics["mip"]
+            report_lines.append(f"  Battery death allowed                : {'yes':>10}")
+            report_lines.append(f"  Battery                              : {death_text:>10}")
+            report_lines.append(f"  Operating life                       : {last_alive:>10d} years")
+            report_lines.append(f"  MIP time / gap                       : {mip['seconds']:>10.0f} s | {mip['gap'] * 100:.4f} %")
+            report_lines.append(f"  LP re-solve for duals                : {mip['lp_seconds']:>10.0f} s")
+        if "retirement_years" in info:
+            report_lines.append(f"  Chosen operating life                : {info['retirement_years']:>10d} years")
+            for years, npv_y, cap_y in retirement_table:
+                report_lines.append(f"  {f'  NPV, LP end capacity if {years} years':<36} : {npv_y:>10.2f} | {cap_y:.3f}")
+        report_lines.append(f"  Simultaneous charge/discharge hours  : {simultaneous:>10d} h")
+        if simultaneous and ds.lp_power_sharing:
+            print(
+                f"Warning: {simultaneous} hours charge and discharge at once. The LP power-sharing "
+                "constraint limits but does not forbid this with separate buy/sell prices.",
+                flush=True,
+            )
 
     # Combined system (BESS + generation).
     if generation_mwh is not None:
@@ -1233,7 +2775,14 @@ def main() -> None:
             for cell in row:
                 cell.number_format = comma_format
 
+        if periods_df is not None:
+            periods_df.to_excel(writer, sheet_name=("Periods" + output_suffix)[:31], index=False)
+            yearly_df.to_excel(writer, sheet_name=("Yearly" + output_suffix)[:31], index=False)
+
     print(f"\nWrote {output_path.resolve()}")
+    if periods_df is not None:
+        print(f"Wrote {periods_path.resolve()}")
+        print(f"Wrote {yearly_path.resolve()}")
     print(f"Wrote {report_path.resolve()}")
     print(f"Wrote {excel_path.resolve()}")
 

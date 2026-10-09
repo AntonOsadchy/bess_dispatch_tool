@@ -1,7 +1,7 @@
 COMPOSE ?= docker compose -f docker/docker-compose.yml
 SERVICE ?= app
 
-.PHONY: build shell run run-dispatch python pip-install clean
+.PHONY: build shell run run-dispatch python pip-install test clean
 
 build:
 	$(COMPOSE) build $(SERVICE)
@@ -19,6 +19,9 @@ python:
 
 pip-install:
 	$(COMPOSE) run --rm $(SERVICE) pip install -r docker/requirements.txt
+
+test:
+	$(COMPOSE) run --rm $(SERVICE) python3 -m pytest tests -q
 
 clean:
 	$(COMPOSE) down --rmi local 2>/dev/null || true
