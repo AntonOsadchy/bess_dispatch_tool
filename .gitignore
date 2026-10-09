@@ -3,3 +3,7 @@
 *.txt
 !specification.txt
 !docker/requirements.txt
+# Local model runs (inputs, logs and results)
+runs/
+*.log
+.DS_Store
