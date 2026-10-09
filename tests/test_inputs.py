@@ -81,7 +81,7 @@ def _curves(rows):
 @pytest.mark.parametrize(
     "rows",
     [
-        [(1, 0, 1), (1, 1, 0.98)],                                                        # only one rate
+        [(0, 0, 1), (0, 1, 0.98)],                                                        # rate 0
         [(r, 0, 1) for r in (1, 1.5, 2)] + [(1, 1, 1.01), (1.5, 1, 0.97), (2, 1, 0.96)],  # SoH rises
         [(r, 0, 0.9) for r in (1, 1.5, 2)] + [(r, 1, 0.8) for r in (1, 1.5, 2)],          # year 0 != 1
         [(r, y, 1 - 0.01 * y) for r in (1, 1.5, 2) for y in (0, 1, 3)],                   # year gap

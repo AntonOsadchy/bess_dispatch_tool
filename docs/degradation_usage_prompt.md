@@ -20,12 +20,16 @@ section of `README.md` first, including "Retirement choice" and its note on curv
 
 **Settings to use**
 ```
-endogenous_degradation = true
-degradation_method = cumulative
-degradation_period = year
-extrapolate_below_lowest_rate = false
-discount_rate = <WACC>
+degradation_curves_csv = <path>     # giving curves switches degradation on
+discount_rate = <WACC>              # default 0 = undiscounted
 ```
+These defaults then apply:
+- **No curve file:** the fixed-capacity model.
+- **One curve:** capacity follows that curve for exactly its lifetime.
+- **Several curves:** the cumulative interpolation, plus an automatic retirement search over every year
+  from the fastest to the slowest curve's life.
+
+`retirement_years = <list>` overrides the candidates, and `retirement_years = off` disables the search.
 Don't use `allow_battery_death` (experimental, doesn't scale). `degradation_curve_fit` has been
 removed.
 
@@ -36,9 +40,9 @@ removed.
    - If there is a "not concave" warning, show which years and how far the model reads above the
      curves (`capacity_end_curves_mwh` vs `capacity_end_mwh`), and stop to ask me.
    - The price horizon covers the longest candidate lifetime.
-2. **Retirement search.** Candidate lifetimes from the fastest curve's life to `<min(slowest curve life,
-   price horizon)>`, first a coarse pass of `<e.g. 4-5 years spread over the range>`. Use one spec and
-   output folder per candidate (`retirement_years = H`). Run at most two at a time, pairing a long with
+2. **Retirement search** (several curves only). Start with a coarse pass of `<e.g. 4-5 years spread over
+   the range>` instead of the default every-year search. For speed, use one spec and output folder per
+   candidate (`retirement_years = H`). Run at most two at a time, pairing a long with
    a short candidate, each under a memory guard: kill a run if it exceeds about 4.5 GB or if system free
    memory drops below 8% (the machine has 8 GB of RAM).
 3. **Report back** with a table per candidate:

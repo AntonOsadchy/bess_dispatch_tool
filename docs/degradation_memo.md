@@ -23,7 +23,12 @@ Shorter lives with harder cycling were all worse: 13 years gave 0.91 M€, 22 ye
   columns. This reproduces the spreadsheet logic (column F of the Hithium sheet) within 0.0003.
 - **Limits:** the average cycles/day since commissioning stays within the curves' range (e.g. 1–2/day).
   Capacity must stay at or above end of life while the battery operates.
-- **Lifetime:** `retirement_years` solves one LP per candidate lifetime and keeps the highest NPV.
+- **Mode from inputs:**
+  - **No curve file:** the original fixed-capacity model.
+  - **One curve:** SoH follows it, and the run lasts exactly its lifetime.
+  - **Several curves:** interpolation between the curves plus an automatic retirement search, one LP
+    per candidate lifetime, keeping the highest NPV.
+- **Discounting:** `discount_rate` works in every mode and defaults to 0.
 - **Outputs:** hourly dispatch plus a per-year table (capacity, cycles, cumulative cycles, average rate,
   calendar and cycle loss, value of capacity, implied degradation cost) and an NPV report.
 - **Fixed-capacity model unchanged:** with degradation off, results are byte-identical to `main`.

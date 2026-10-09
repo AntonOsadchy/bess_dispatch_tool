@@ -127,7 +127,10 @@ Docker Desktop alone is enough.
 | `generation_profile_csv` | no | Uncomment to enable co-location mode (single-column, headerless capacity-factor CSV `[0–1]`, one row per timestep). See "Co-location mode" for how available generation is computed. |
 | `generation_max_mw` | no* | Nameplate capacity of the co-located generator (MW); required when `generation_profile_csv` is set |
 | `existing_dispatch_profile_csv` | no | Path to a prior run's output CSV that the BESS must honour as a dispatch floor; the optimizer finds additional value on top. See "Existing dispatch profile workflow" below. |
-| `endogenous_degradation` | no | `true` makes capacity a decision variable that degrades with cycling and age, over a multi-year horizon with discounting (default `false`, the fixed-capacity model). Further keys in "Endogenous degradation". |
+| `degradation_curves_csv` | no | SoH curves by battery age. **Giving this file switches degradation on**; the number of curves picks the mode (see "How the tool picks the mode"). Further keys in "Endogenous degradation". |
+| `endogenous_degradation` | no | Normally not needed. `false` ignores `degradation_curves_csv` (fixed-capacity model); `true` without curves is an error. |
+| `discount_rate` | no | Discount rate per year applied to every hour's cash flow by battery age year (default 0, undiscounted). Works with and without degradation. With a non-zero rate and no degradation the report adds the NPV; "Total profit" stays undiscounted. |
+| `discount_convention` | no | `end` (default): DF[y] = 1/(1+r)^(y−1); `mid`: 1/(1+r)^(y−0.5). |
 
 \* Required only when `generation_profile_csv` is active.
 
@@ -414,25 +417,36 @@ ch_from_gen_curt[t] + ch_from_gen_surplus[t]`.
 
 ## Endogenous degradation
 
-With `endogenous_degradation = true` the optimiser decides how hard to cycle in each period knowing that
+When degradation curves are given, the optimiser decides how hard to cycle in each period knowing that
 cycling (and age) reduces future capacity, and trades today's revenue against tomorrow's capacity in one
-solve. The horizon is the length of the price series (any number of years, hourly). The model stays a
-**pure LP** (no binaries) and is solved with HiGHS (dual simplex by default; see "Solver choice"). Everything in the fixed-capacity
-model (tariffs, co-location, grid caps, cycle caps, profile floors) still applies.
+solve. The model stays a **pure LP** (no binaries) and is solved with HiGHS (dual simplex by default; see
+"Solver choice"). Everything in the fixed-capacity model (tariffs, co-location, grid caps, cycle caps,
+profile floors) still applies.
+
+### How the tool picks the mode
+
+| Inputs | What runs |
+|---|---|
+| No `degradation_curves_csv` | Fixed capacity over the whole price series: the original model, unchanged (results identical to before). |
+| One curve (one cycling rate, e.g. `year,1`) | SoH follows that curve by age; the run lasts **exactly the curve's lifetime** (later prices are ignored; fewer prices than the lifetime is an error). Average cycling since commissioning is capped at the curve's rate. |
+| Two or more curves (e.g. `year,1,1.25,1.5`) | SoH interpolated between the curves at the average cycles/day since commissioning (`cumulative` method), and a **retirement search** over lifetimes from the fastest to the slowest curve's life (within the price horizon). See "Retirement choice". |
+
+With several curves, `retirement_years` overrides the candidate lifetimes (e.g. `18,21,25`), and
+`retirement_years = off` runs the price horizon with the battery required to survive it. If the prices
+end before the fastest curve's life, the battery cannot die within them and a single run is made.
 
 ### Additional specification keys
 
 | Key | Default | Description |
 |---|---|---|
 | `degradation_method` | `cumulative` | `cumulative`: capacity at the end of each period is read from the curves at the average cycling rate since commissioning. `period`: each period's loss follows that period's own cycling (bands and transitions). See "Two degradation methods". |
-| `degradation_curves_csv` | required | SoH curves, long layout `cycles_per_day,year,value` or wide layout `year,<rate>,<rate>,...` (e.g. `year,1,1.25,1.5`, blank once a curve has ended): `year` = battery age in years (0 = commissioning, value 1.0, added if missing), `value` = state of health as a fraction of nominal energy; at least two cycling rates. Each curve runs until end of life, so curves may have different lengths (the longest must cover the horizon), but they **must all end at the same SoH**, which becomes the end-of-life limit (C10). Different final values are an error (tolerance 0.0001). |
+| `degradation_curves_csv` | — | SoH curves, long layout `cycles_per_day,year,value` or wide layout `year,<rate>,<rate>,...` (e.g. `year,1,1.25,1.5`, blank once a curve has ended): `year` = battery age in years (0 = commissioning, value 1.0, added if missing), `value` = state of health as a fraction of nominal energy; one or more cycling rates. A trailing 0 marks a dead curve and is dropped. Each curve runs until end of life, so curves may have different lengths (the longest must cover the horizon), but they **must all end at the same SoH**, which becomes the end-of-life limit (C10). Different final values are an error (tolerance 0.0001). |
 | `calendar_curve_csv` | extrapolated | Optional zero-cycling SoH curve, header `year,value`. Without it calendar loss is extrapolated linearly from the two lowest-rate curves. |
-| `extrapolate_below_lowest_rate` | `true` | `cumulative` method without `calendar_curve_csv`: `true` estimates a zero-cycling SoH by linear extrapolation through the two lowest rates still alive (capped at 1, never rising with age); `false` takes the curves exactly as given and uses the lowest-rate curve's value below that rate. |
+| `extrapolate_below_lowest_rate` | `false` | `cumulative` method without `calendar_curve_csv`. `false` (default) takes the curves exactly as given and keeps the average cycles/day since commissioning at or above the lowest rate; `true` estimates a zero-cycling SoH by linear extrapolation through the two lowest rates still alive (capped at 1, never rising with age); `false` takes the curves exactly as given and uses the lowest-rate curve's value below that rate. |
 | `degradation_period` | `year` | `year` or `month`. Years are age years from the first timestep (anniversaries); months are months since the first timestep, 12 to each age year. |
 | `month_degradation_multipliers` | 1 | 12 comma-separated factors (January…December) on calendar loss and damage per cycle, for monthly periods with the `period` method only (hook for temperature effects). |
 | `cycle_weight_charge`, `cycle_weight_discharge` | 0, 1 | Weights `a_ch`, `a_dis` in the cycle count: (0, 1) discharge-based, (0.5, 0.5) average-based. Must match how the curves define cycles. |
-| `discount_rate` | 0 | Discount rate per year (real or nominal, consistent with the prices). |
-| `discount_convention` | `end` | `end`: DF[y] = 1/(1+r)^(y−1); `mid`: 1/(1+r)^(y−0.5). |
+| `discount_rate`, `discount_convention` | 0, `end` | See the main key table; with degradation the NPV is the objective. |
 | `soc_min_fraction`, `soc_max_fraction` | 0, 1 | SoC limits as fractions of the degraded capacity. |
 | `final_soc_fraction` | `initial_soc` | SoC in the last hour ≥ this × end capacity (0 disables). |
 | `terminal_value_per_mwh` | 0 | Value of each MWh of capacity left at the end of the horizon, discounted to today. |
@@ -440,7 +454,7 @@ model (tariffs, co-location, grid caps, cycle caps, profile floors) still applie
 | `warranty_throughput_mwh` | off | Limit on total cycle-weighted stored throughput over the horizon. |
 | `allow_battery_death` | `false` | **Experimental, does not scale; use `retirement_years`.** `cumulative` method: one yes/no "alive" switch per age year, so the optimiser may let the battery die (capacity 0, no revenue) within the horizon. Makes the model a MIP. See "Battery death". |
 | `mip_rel_gap`, `mip_time_limit_s` | 0.0001, off | Stopping rules for the MIP with `allow_battery_death` (relative gap; time limit in seconds, keeping the best solution found). |
-| `retirement_years` | off | Let the model choose when the battery dies, e.g. `18-20` or `15,18,20` (whole age years). See "Retirement choice". |
+| `retirement_years` | automatic | Several curves: candidate lifetimes, default every year from the fastest to the slowest curve's life within the price horizon. Override with e.g. `18-20` or `15,18,20`; `off` disables the search. Not allowed with a single curve. See "Retirement choice". |
 | `solver_method` | `simplex` | HiGHS method (`simplex`, `ipm`, `choose`). See "Solver choice". |
 | `run_crossover` | `on` | Crossover after interior point (`on`, `off`, `choose`); only used with `ipm`. With `off`, a run that does not end optimal is repeated with crossover on. |
 
@@ -605,9 +619,8 @@ Either way it is the *average* that is limited: single years may lie outside the
 
 ### Retirement choice
 
-Without `retirement_years` the battery operates for the whole price horizon and must still be at or
-above end of life at its end, so it can never die early. With `retirement_years`, the tool solves one
-LP per candidate operating life `H`: the battery operates for the first `H` age years, must be at or
+With several curves (or `retirement_years` set), the tool solves one LP per candidate operating life
+`H`: the battery operates for the first `H` age years, must be at or
 above end of life at the end of year `H` (C10), and earns nothing afterwards (terminal value, if set,
 is counted at `H`). The candidate with the highest NPV is kept (the shorter one on a tie) and all
 outputs cover its operating life only; the report lists every candidate's NPV and end capacity.
@@ -623,10 +636,11 @@ is therefore exactly the MIP's answer (checked in `tests/test_degradation.py`), 
 cover every death year that could win and no terminal value is set (the search values capacity left
 at `H`; the MIP gives a dead battery none).
 
-**Running candidates in parallel.** One process holding all candidates keeps the best model in memory
-while solving the next, so for long horizons run one spec per candidate (`retirement_years = H`, own
-`output_csv`) and compare the reported NPVs. Memory per 25-year hourly candidate was about 2 GB; on an
-8 GB machine run at most two at once.
+**Run time and memory.** Only one candidate model is kept in memory at a time; if the winner is not
+the last candidate solved, it is solved again at the end (one extra LP). A 25-year hourly candidate takes
+about 4–9 minutes and 2 GB, so the default 13-candidate search on 13–25-year curves takes about 1–1.5
+hours. To save time, give a coarse `retirement_years` (e.g. `13,16,19,22,25`), or run one spec per
+candidate (`retirement_years = H`, own `output_csv`) in parallel, at most two at once on an 8 GB machine.
 
 **Curve shape.** The end-of-life limit is exact by the input curves only if, at every age, each extra
 step in cycling rate costs at least as much SoH as the previous one (SoH concave in cumulative cycles).
@@ -714,12 +728,17 @@ below the LP's.
 7. Yearly and monthly periods agree on revenue, cycles and end capacity (within 2%).
 8. Convex-envelope repair, the dual sign (finite difference), the pure-LP property, input formats
    and DST, and end-to-end outputs. `RUN_SLOW=1` adds a 7-year hourly smoke test.
-9. `cumulative` method: the lookup interpolates between rate columns and hits every curve point; the
+9. Modes from inputs: curves switch degradation on, `endogenous_degradation = false` ignores them
+   (identical outputs), several curves run the retirement search automatically (same answer as an
+   explicit search), `retirement_years = off` disables it, a single curve runs exactly its lifetime with
+   capacity following the curve; `discount_rate = 0` changes nothing and a non-zero rate discounts the
+   fixed-capacity model.
+10. `cumulative` method: the lookup interpolates between rate columns and hits every curve point; the
    capacity path depends only on total cycles (2 then 1 cycles/day ends where 1.5/day does); forced 1
    and 2 cycles/day reproduce the curves; cycling is capped at the highest rate; capacity value and
    degradation cost match finite differences; end-to-end outputs.
 
-10. Battery death: trailing zeros in curves are dropped; the average cycling limits hold; the
+11. Battery death: trailing zeros in curves are dropped; the average cycling limits hold; the
     `allow_battery_death` MIP and the `retirement_years` search give the same NPV and lifetime; removed
     or misplaced keys (`eol_fraction`, `degradation_curve_fit`) are rejected.
 

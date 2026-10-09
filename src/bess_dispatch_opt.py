@@ -16,10 +16,14 @@ fallback for whichever side is missing and, in co-location mode, the reference p
 generation revenue and the wasted-generation refund (see resolve_prices). A single series (any one of
 the three keys) is used for buy and sell alike.
 
-Endogenous degradation (optional, endogenous_degradation = true): capacity becomes a variable per
-degradation period (year or month) that falls with calendar ageing and cycling, using convex cycle bands
-derived from SoH curves; cash flows are discounted per age year. Pure LP, solved with HiGHS interior
-point. See add_degradation_block and README § "Endogenous degradation".
+Degradation (on whenever degradation_curves_csv is given; endogenous_degradation = false switches it
+off): capacity becomes a variable per year (or month) read from SoH curves by battery age. With one
+curve, SoH follows it and the run lasts exactly its lifetime. With curves for several cycling rates,
+SoH is interpolated at the average cycles/day since commissioning and a retirement search (one LP per
+candidate lifetime) picks the lifetime with the highest NPV. Pure LP, HiGHS dual simplex. See
+add_degradation_block and README § "Endogenous degradation".
+
+Discounting (all modes): discount_rate (default 0) discounts each hour's cash flow by its age year.
 
 Inputs can be headerless single-column CSVs or dated CSVs (year,month,day,hour,value); see
 load_timeseries_csv.
@@ -102,6 +106,7 @@ Three additional constraints are added in co-location mode:
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import os
 import random
@@ -453,8 +458,9 @@ def load_degradation_curves(path: Path) -> dict[float, list[float]]:
       wide: header `year, <rate>, <rate>, ...` (e.g. `year,1,1.25,1.5`), one column per rate,
             blank once a curve has ended.
     year = battery age in years (0 = commissioning, value 1.0; a missing year 0 is added), value =
-    state of health as a fraction of nominal energy. Trailing zeros (dead battery) are dropped. At
-    least two rates are needed. Each curve runs
+    state of health as a fraction of nominal energy. Trailing zeros (dead battery) are dropped. One
+    rate gives a fixed SoH path for exactly that curve's lifetime; two or more rates make capacity
+    depend on cycling (interpolated between rates). Each curve runs
     until end of life, so curves may have different lengths, but they must all end at the same SoH
     (the end-of-life limit). Returns {rate: [SoH(0), SoH(1), ...]} in ascending rate order.
     """
@@ -478,8 +484,8 @@ def load_degradation_curves(path: Path) -> dict[float, list[float]]:
             f"{path}: expected columns cycles_per_day,year,value or year,<rate>,<rate>,... "
             "(e.g. year,1,1.5,2)"
         )
-    if len(raw) < 2 or min(raw) <= 0:
-        sys.exit(f"{path}: need curves for at least two positive cycling rates (got {sorted(raw)})")
+    if not raw or min(raw) <= 0:
+        sys.exit(f"{path}: need at least one curve for a positive cycling rate (got {sorted(raw)})")
     # A curve may end with 0 to mark that the battery is dead from then on (as in a table that
     # switches capacity to 0 below end of life). Those zeros are dropped: the curve ends at its last
     # real value, and past it the model continues with the curve's last yearly loss.
@@ -691,6 +697,20 @@ def period_degradation_params(
     return PeriodDegradation(calendar=cal, widths=widths, damage=damage)
 
 
+def step_discount_factors(
+    n_steps: int, start: str | pd.Timestamp | None, timezone: str, rate: float, convention: str
+) -> list[float]:
+    """Discount factor of each hourly timestep, by battery age year (anniversaries of the first
+    timestep). Without a start date every 8,760 timesteps count as one year."""
+    if start is not None:
+        periods = build_periods(make_timeline(n_steps, start, timezone), "year")
+        years = [periods.age_year[p] for p in periods.of_step]
+    else:
+        years = [t // 8760 + 1 for t in range(n_steps)]
+    by_year = {y: discount_factor(y, rate, convention) for y in set(years)}
+    return [by_year[y] for y in years]
+
+
 def discount_factor(age_year: float, rate: float, convention: str = "end") -> float:
     """1/(1+r)^(y−1) for convention "end" (as specified), 1/(1+r)^(y−0.5) for "mid"."""
     exponent = age_year - (0.5 if convention == "mid" else 1.0)
@@ -734,6 +754,27 @@ class SohLookup:
         """SoH interpolated from the curve points without the concave envelope (for reporting)."""
         xs = [DAYS_PER_YEAR * self.age_end[p] * r for r in self.rate_points]
         return float(np.interp(cycles, xs, self.raw_points[p]))
+
+
+def build_single_curve_lookup(
+    curve: list[float], rate: float, periods: Periods
+) -> SohLookup:
+    """Lookup for a single SoH curve: capacity follows the curve by age alone (it does not depend
+    on how the battery is cycled), and the average cycling since commissioning is capped at the
+    curve's rate, which the curve assumes. The horizon must not exceed the curve's lifetime."""
+    life = len(curve) - 1
+    age_end = list(np.cumsum(periods.year_fraction))
+    if age_end[-1] > life + 1e-9:
+        sys.exit(
+            f"The degradation curve covers {life} years but the price horizon needs "
+            f"{age_end[-1]:.2f}; with a single curve the run lasts exactly the curve's lifetime."
+        )
+    soh = [soh_at_age(curve, a) for a in age_end]
+    return SohLookup(
+        age_end=age_end, rate_points=[rate], soh_points=[[v] for v in soh],
+        raw_points=[[v] for v in soh], lines=[[(v, 0.0)] for v in soh], calendar_soh=soh,
+        max_rate=rate,
+    )
 
 
 def build_soh_lookup(
@@ -1034,6 +1075,9 @@ def prepare_degradation(
     if curves_csv is None:
         sys.exit("endogenous_degradation needs degradation_curves_csv")
     curves = load_degradation_curves(Path(curves_csv))
+    single = len(curves) == 1
+    if single and method == "period":
+        sys.exit("degradation_method = period needs curves for at least two cycling rates.")
     eol = curves_end_of_life(curves)
     if "degradation_curve_fit" in spec:
         sys.exit(
@@ -1049,6 +1093,8 @@ def prepare_degradation(
         calendar_curve = _validate_soh(years, [raw[y] for y in years], calendar_csv)
     yearly: dict[int, YearDegradation] = {}
     warnings: list[str] = []
+    if single and calendar_csv is not None:
+        warnings.append("calendar_curve_csv ignored: with a single curve SoH follows that curve.")
     if method == "period":
         yearly, warnings = derive_degradation_params(curves, calendar_curve)
 
@@ -1068,12 +1114,15 @@ def prepare_degradation(
     timeline = make_timeline(n_steps, start, timezone)
     periods = build_periods(timeline, freq)
     params, lookup = None, None
+    extrapolate_below = spec_bool(spec, "extrapolate_below_lowest_rate", default=False)
     if method == "period":
         params = period_degradation_params(periods, yearly, month_mult)
+    elif single:
+        (rate_1, curve_1), = curves.items()
+        lookup = build_single_curve_lookup(curve_1, rate_1, periods)
     else:
         lookup, lookup_warnings = build_soh_lookup(
-            curves, periods, calendar_curve,
-            extrapolate_below_lowest_rate=spec_bool(spec, "extrapolate_below_lowest_rate", default=True),
+            curves, periods, calendar_curve, extrapolate_below_lowest_rate=extrapolate_below,
         )
         warnings += lookup_warnings
 
@@ -1104,10 +1153,11 @@ def prepare_degradation(
     crossover = (spec_optional_str(spec, "run_crossover") or "on").lower()
     if crossover not in ("on", "off", "choose"):
         sys.exit("run_crossover must be on, off or choose")
-    extrapolate_below = spec_bool(spec, "extrapolate_below_lowest_rate", default=True)
     allow_death = spec_bool(spec, "allow_battery_death", default=False)
     if allow_death and method != "cumulative":
         sys.exit("allow_battery_death needs degradation_method = cumulative")
+    if allow_death and single:
+        sys.exit("allow_battery_death needs curves for at least two cycling rates.")
     setup = DegradationSetup(
         periods=periods,
         params=params,
@@ -1128,7 +1178,9 @@ def prepare_degradation(
         run_crossover=crossover,
         method=method,
         lookup=lookup,
-        min_average_rate=min(curves) if method == "cumulative" and not extrapolate_below else None,
+        min_average_rate=(
+            min(curves) if method == "cumulative" and not extrapolate_below and not single else None
+        ),
         allow_death=allow_death,
         mip_time_limit_s=spec_optional_float(spec, "mip_time_limit_s"),
         mip_rel_gap=spec_float(spec, "mip_rel_gap", default=1e-4),
@@ -1136,6 +1188,7 @@ def prepare_degradation(
     info = {
         "freq": freq,
         "method": method,
+        "curves_mode": "single curve" if single else "multi-curve",
         "curves_csv": curves_csv,
         "calendar_csv": calendar_csv,
         "warnings": warnings,
@@ -1456,6 +1509,9 @@ def build_and_solve(
     # Endogenous degradation (None = fixed capacity, the original model). When set, the model is
     # a pure LP solved with HiGHS and C6 must be off.
     degradation: DegradationSetup | None = None,
+    # Fixed-capacity model only: discount factor of each timestep (None = undiscounted, the
+    # original objective). With degradation the factors come from the DegradationSetup.
+    discount_factors: list[float] | None = None,
 ) -> tuple[pyo.ConcreteModel, pyo.SolverResults, dict]:
     rte = round_trip_efficiency
     if not (0 < rte <= 1):
@@ -1727,7 +1783,20 @@ def build_and_solve(
     }
 
     if degradation is None:
-        m.obj = pyo.Objective(rule=profit_rule, sense=pyo.maximize)
+        if discount_factors is None:
+            m.obj = pyo.Objective(rule=profit_rule, sense=pyo.maximize)
+        else:
+            if len(discount_factors) != T:
+                sys.exit("discount_factors must have one value per timestep")
+            # [O4] Discounted fixed-capacity objective: each hour's cash flow times its age year's
+            # discount factor. m.op_cash keeps the undiscounted terms for reporting.
+            m.op_cash = pyo.Expression(
+                m.T,
+                rule=lambda mm, t: standalone_term(mm, t)
+                + (colocation_addendum_term(mm, t) if generation_mwh is not None else 0.0),
+            )
+            m.npv = pyo.Expression(expr=sum(discount_factors[t] * m.op_cash[t] for t in times))
+            m.obj = pyo.Objective(expr=m.npv, sense=pyo.maximize)
 
         solver = pyo.SolverFactory("appsi_highs")
         if not solver.available(False):
@@ -1986,7 +2055,20 @@ def main() -> None:
     # Without it, day boundaries are assumed at fixed 24-row offsets from row 0.
     prices_start_date = spec_optional_str(spec, "prices_start_date")
     prices_timezone = spec_optional_str(spec, "prices_timezone") or "Europe/Copenhagen"
-    endogenous_degradation = spec_bool(spec, "endogenous_degradation", default=False)
+    # Degradation runs whenever a degradation curve file is given; endogenous_degradation can still
+    # switch it off (false) explicitly.
+    degradation_curves_csv = spec_optional_str(spec, "degradation_curves_csv")
+    if spec_optional_str(spec, "endogenous_degradation") is not None:
+        endogenous_degradation = spec_bool(spec, "endogenous_degradation")
+    else:
+        endogenous_degradation = degradation_curves_csv is not None
+    # Discounting (all modes): 0 by default, i.e. undiscounted cash flows.
+    discount_rate = spec_float(spec, "discount_rate", default=0.0)
+    discount_convention = (spec_optional_str(spec, "discount_convention") or "end").lower()
+    if discount_rate <= -1:
+        sys.exit("discount_rate must be > -1")
+    if discount_convention not in ("end", "mid"):
+        sys.exit("discount_convention must be end or mid")
 
     power_mw = spec_float(spec, "power")
     rte = spec_float(spec, "round_trip_efficiency")
@@ -2152,37 +2234,100 @@ def main() -> None:
             prices_start_date=prices_start_date,
             prices_timezone=prices_timezone,
             degradation=setup,
+            discount_factors=step_discount_factors(
+                n_steps, prices_start_date, prices_timezone, discount_rate, discount_convention
+            ) if setup is None and discount_rate != 0 else None,
         )
         return setup, info, out
 
-    # Retirement choice: one LP per candidate operating life (whole age years from the start); the
-    # battery operates up to the end of that year, must still be at or above end of life then, and
-    # earns nothing afterwards. The candidate with the highest NPV is kept.
+    # How long the battery runs, decided by the curves given:
+    #   no curves        -> fixed capacity over the price horizon (the original model);
+    #   one curve        -> capacity follows that curve; the run lasts exactly its lifetime;
+    #   two or more      -> capacity interpolated between the curves at the average cycling rate, and
+    #                       a retirement search over lifetimes from the fastest to the slowest
+    #                       curve's life (within the price horizon): one LP per candidate operating
+    #                       life, at or above end of life at its end, nothing afterwards; the
+    #                       candidate with the highest NPV is kept (the shorter one on a tie).
     retirement_raw = spec_optional_str(spec, "retirement_years")
     retirement_table: list[tuple[int, float, float]] = []   # (years, NPV, end capacity)
+    lifetime_text = ""
+    candidates: list[int] = []
     n_steps = len(prices)
-    if retirement_raw is not None:
-        if not endogenous_degradation:
-            sys.exit("retirement_years needs endogenous_degradation = true")
-        if spec_bool(spec, "allow_battery_death", default=False):
-            sys.exit("Use either retirement_years or allow_battery_death, not both.")
+    if retirement_raw is not None and not endogenous_degradation:
+        sys.exit("retirement_years needs degradation curves (degradation_curves_csv)")
+    if endogenous_degradation:
         if prices_start_date is None:
-            sys.exit("retirement_years needs real timestamps (dated inputs or prices_start_date)")
-        candidates = parse_year_list(retirement_raw)
+            sys.exit(
+                "Degradation needs real timestamps: use dated inputs (year,month,day,hour,value) "
+                "or set prices_start_date."
+            )
+        if degradation_curves_csv is None:
+            sys.exit("endogenous_degradation needs degradation_curves_csv")
+        curves_in = load_degradation_curves(Path(degradation_curves_csv))
+        lives = {r: len(c) - 1 for r, c in curves_in.items()}
         years_full = build_periods(
             make_timeline(len(prices), prices_start_date, prices_timezone), "year"
         )
         year_of_step = [years_full.age_year[p] for p in years_full.of_step]
-        steps_by_year = {y: sum(1 for a in year_of_step if a <= y) for y in candidates}
         horizon_years = max(year_of_step)
+
+        def steps_upto(years: int) -> int:
+            return sum(1 for a in year_of_step if a <= years)
+
+        allow_death = spec_bool(spec, "allow_battery_death", default=False)
+        if len(curves_in) == 1:
+            if retirement_raw is not None:
+                sys.exit("retirement_years needs curves for at least two cycling rates: a single "
+                         "curve fixes the lifetime.")
+            (rate_1, life), = lives.items()
+            if life > horizon_years:
+                sys.exit(
+                    f"The degradation curve covers {life} years but the prices cover only "
+                    f"{horizon_years}; with a single curve the run lasts exactly the curve's lifetime."
+                )
+            n_steps = steps_upto(life)
+            lifetime_text = f"single curve, fixed {life} years"
+            if n_steps < len(prices):
+                print(f"Note: single degradation curve: running its {life}-year lifetime; later "
+                      "prices are not used.", flush=True)
+        elif retirement_raw is not None and retirement_raw.lower() in ("off", "none", "no", "false"):
+            lifetime_text = "must survive the price horizon"
+        elif retirement_raw is not None:
+            if allow_death:
+                sys.exit("Use either retirement_years or allow_battery_death, not both.")
+            candidates = parse_year_list(retirement_raw)
+        elif allow_death:
+            lifetime_text = "battery death (MIP, experimental)"
+        else:
+            lo, hi = min(lives.values()), min(max(lives.values()), horizon_years)
+            if lo <= hi:
+                candidates = list(range(lo, hi + 1))
+            else:
+                lifetime_text = (
+                    f"must survive the price horizon ({horizon_years} years is shorter than the "
+                    f"fastest curve's {lo}-year life)"
+                )
         too_long = [y for y in candidates if y > horizon_years]
         if too_long:
             sys.exit(
                 f"retirement_years {too_long} exceed the price horizon ({horizon_years} age years); "
                 "extend the price series or drop them."
             )
-        best = None
+
+    if candidates:
+        steps_by_year = {y: steps_upto(y) for y in candidates}
+        lifetime_text = (
+            f"retirement search {candidates[0]}-{candidates[-1]} years ({len(candidates)} candidates)"
+            if candidates == list(range(candidates[0], candidates[-1] + 1))
+            else f"retirement search {', '.join(map(str, candidates))} years"
+        )
+        print(f"Retirement search: {len(candidates)} candidate lifetimes "
+              f"({', '.join(map(str, candidates))} years), one LP each.", flush=True)
+        best_years, best_npv = None, None
+        kept = None      # only the last solved candidate is kept in memory
         for i, years in enumerate(candidates):
+            kept = None
+            gc.collect()
             start_time = time.time()
             print(f"Retirement candidate: {years} years ...", flush=True)
             setup_y, info_y, out_y = solve_horizon(steps_by_year[years], show_warnings=i == 0)
@@ -2194,13 +2339,24 @@ def main() -> None:
                 flush=True,
             )
             retirement_table.append((years, npv_y, end_cap_y))
-            if best is None or npv_y > best[0]:
-                best = (npv_y, years, setup_y, info_y, out_y)
-        _, best_years, degradation_setup, degradation_info, (model, results, metrics) = best
+            if best_npv is None or npv_y > best_npv + 1e-7 * max(1.0, abs(best_npv)):
+                best_years, best_npv = years, npv_y
+            kept = (years, setup_y, info_y, out_y)
+            del setup_y, info_y, out_y
+        if kept[0] != best_years:
+            # The winner was solved earlier and released to save memory: solve it again.
+            kept = None
+            gc.collect()
+            print(f"Re-solving the chosen lifetime ({best_years} years) ...", flush=True)
+            kept = (best_years, *solve_horizon(steps_by_year[best_years], show_warnings=False))
+        _, degradation_setup, degradation_info, (model, results, metrics) = kept
+        kept = None
         n_steps = steps_by_year[best_years]
         degradation_info["retirement_years"] = best_years
     else:
         degradation_setup, degradation_info, (model, results, metrics) = solve_horizon(n_steps)
+    if degradation_setup is not None:
+        degradation_info["lifetime_mode"] = lifetime_text or "must survive the price horizon"
 
     # Everything below reports the chosen operating life only.
     if n_steps < len(prices):
@@ -2224,7 +2380,7 @@ def main() -> None:
             f"termination={results.solver.termination_condition}"
         )
 
-    if degradation_setup is None:
+    if degradation_setup is None and discount_rate == 0:
         total_profit = pyo.value(model.obj)
     else:
         # Undiscounted operating profit, comparable with the fixed-capacity model; the NPV
@@ -2435,6 +2591,9 @@ def main() -> None:
     report_lines.append(f"  Spot revenue (gross, before tariffs) : {spot_gross:>10.2f} €")
     report_lines.append(f"  Tariff charges                       : {tariff_component:>10.2f} €")
     report_lines.append(f"  Total profit                         : {total_profit:>10.2f} €")
+    if degradation_setup is None and discount_rate != 0:
+        report_lines.append(f"  Discount rate                        : {discount_rate*100:>10.2f} % ({discount_convention}-year)")
+        report_lines.append(f"  NPV (discounted profit)              : {pyo.value(model.npv):>10.2f} €")
     report_lines.append(f"  Charging volume                      : {total_charge_mwh:>10.2f} MWh")
     if math.isnan(weighted_avg_charge_cost):
         report_lines.append("  Weighted avg charging cost           :        n/a  €/MWh")
@@ -2477,6 +2636,8 @@ def main() -> None:
         report_lines.append(f"  Degradation curves CSV               : {info['curves_csv']}")
         report_lines.append(f"  Calendar curve CSV                   : {info['calendar_csv'] or 'extrapolated'}")
         report_lines.append(f"  Cycling rates in curves              : {', '.join(f'{r:g}' for r in sorted(info['rates']))} per day")
+        report_lines.append(f"  Degradation curves mode              : {info['curves_mode']:>10}")
+        report_lines.append(f"  Lifetime                             : {info['lifetime_mode']}")
         report_lines.append(f"  Degradation method                   : {info['method']:>10}")
         report_lines.append(f"  Degradation period                   : {info['freq']:>10}")
         report_lines.append(f"  Periods                              : {len(ds.periods.hours):>10d}")
