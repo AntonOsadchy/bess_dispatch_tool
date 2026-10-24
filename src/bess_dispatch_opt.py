@@ -1655,7 +1655,7 @@ def build_and_solve(
             grid_export_mw if grid_export_mw is not None else power_mw
         ) * dt
 
-        # Refund price for charging from curtailed / clipped generation (see colocation_addendum_term).
+        # Refund price for charging from curtailed / clipped generation (see cf_spot_cost).
         m.price_refund = pyo.Param(m.T, initialize={t: prices.refund[t] for t in times})
 
         # Curtailed generation: fully curtailed (would not be exported at all) whenever the
@@ -1736,42 +1736,54 @@ def build_and_solve(
 
         m.ch_btm_split = pyo.Constraint(m.T, rule=ch_btm_split_rule)  # [C5]
 
-    def standalone_term(mm, t):
-        # O1 — stand-alone objective term. Applied unconditionally: in co-location mode this
-        # still taxes all of ch_mwh[t] (as if every MWh were grid-taxable) and prices all of it
-        # at the buy price; colocation_addendum_term below corrects both for the BTM-sourced share.
-        ct = mm.ctariff[t] if consumption_tariffs is not None else charge_tariff
-        return (
-            mm.price_sell[t] * mm.dsch_mwh[t]
-            - mm.price_buy[t] * mm.ch_mwh[t]
-            - discharge_tariff * mm.dsch_mwh[t]
-            - ct * mm.ch_mwh[t]
-        )
+    # [O1-O2] Per-timestep cash flows (EUR), one Expression per component. The objective is
+    # built from cf_profit, and callers read the same Expressions back with hourly_cashflows(),
+    # so reported money can never differ from what the optimiser maximised.
+    #
+    # Stand-alone terms apply to all of ch_mwh[t] / dsch_mwh[t]. In co-location mode each
+    # component then subtracts the BTM-sourced share it should not carry:
+    #   - spot cost: price_refund[t] * (ch_from_gen_curt + ch_from_gen_surplus) — generation that
+    #     would have been wasted (curtailed or clipped) regardless has zero opportunity cost.
+    #     Cancels the buy-price charge exactly only when price_refund == price_buy (single price
+    #     series).
+    #   - charge tariff: ct * ch_btm[t] — only the grid-imported share ch_grid_mwh[t] is taxed.
+    #   - discharge tariff: discharge_tariff * ch_from_gen_avail — the only BTM source whose later
+    #     discharge doesn't create new net export (see B5/C5 discussion above).
+    colocated = generation_mwh is not None
 
-    def colocation_addendum_term(mm, t):
-        # Co-location addendum on top of standalone_term — added, not substituted:
-        #   + ct * ch_btm[t]: refunds charge_tariff on BTM charging (standalone_term taxed all of
-        #     ch_mwh[t]; only the grid-imported share ch_grid_mwh[t] should actually be taxed).
-        #   + price_refund[t] * (ch_from_gen_curt + ch_from_gen_surplus): refunds the spot
-        #     opportunity cost standalone_term charged on this share — it would have been wasted
-        #     (curtailed or clipped) regardless, so it has zero true opportunity cost. Cancels the
-        #     buy-price charge exactly only when price_refund == price_buy (single price series).
-        #   + discharge_tariff * ch_from_gen_avail: refund for the only BTM source whose later
-        #     discharge doesn't create new net export (see B5/C5 discussion above).
-        ct = mm.ctariff[t] if consumption_tariffs is not None else charge_tariff
-        ch_btm_t = mm.ch_from_gen_avail[t] + mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t]
-        return (
-            ct * ch_btm_t
-            + mm.price_refund[t] * (mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t])
-            + discharge_tariff * mm.ch_from_gen_avail[t]
-        )
+    def charge_tariff_at(mm, t):
+        return mm.ctariff[t] if consumption_tariffs is not None else charge_tariff
+
+    def ch_btm(mm, t):
+        return mm.ch_from_gen_avail[t] + mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t]
+
+    m.cf_spot_revenue = pyo.Expression(
+        m.T, rule=lambda mm, t: mm.price_sell[t] * mm.dsch_mwh[t]
+    )
+    m.cf_spot_cost = pyo.Expression(
+        m.T,
+        rule=lambda mm, t: mm.price_buy[t] * mm.ch_mwh[t]
+        - (mm.price_refund[t] * (mm.ch_from_gen_curt[t] + mm.ch_from_gen_surplus[t])
+           if colocated else 0.0),
+    )
+    m.cf_charge_tariff = pyo.Expression(
+        m.T,
+        rule=lambda mm, t: charge_tariff_at(mm, t) * mm.ch_mwh[t]
+        - (charge_tariff_at(mm, t) * ch_btm(mm, t) if colocated else 0.0),
+    )
+    m.cf_discharge_tariff = pyo.Expression(
+        m.T,
+        rule=lambda mm, t: discharge_tariff * mm.dsch_mwh[t]
+        - (discharge_tariff * mm.ch_from_gen_avail[t] if colocated else 0.0),
+    )
+    m.cf_profit = pyo.Expression(
+        m.T,
+        rule=lambda mm, t: mm.cf_spot_revenue[t] - mm.cf_spot_cost[t]
+        - mm.cf_charge_tariff[t] - mm.cf_discharge_tariff[t],
+    )
 
     def profit_rule(mm):
-        if generation_mwh is not None:
-            return sum(
-                standalone_term(mm, t) + colocation_addendum_term(mm, t) for t in times
-            )
-        return sum(standalone_term(mm, t) for t in times)
+        return sum(mm.cf_profit[t] for t in times)
 
     # Standard output metrics, independent of what the battery actually did -
     # a dict (not a bare float) so more can be added here later without
@@ -1790,11 +1802,7 @@ def build_and_solve(
                 sys.exit("discount_factors must have one value per timestep")
             # [O4] Discounted fixed-capacity objective: each hour's cash flow times its age year's
             # discount factor. m.op_cash keeps the undiscounted terms for reporting.
-            m.op_cash = pyo.Expression(
-                m.T,
-                rule=lambda mm, t: standalone_term(mm, t)
-                + (colocation_addendum_term(mm, t) if generation_mwh is not None else 0.0),
-            )
+            m.op_cash = pyo.Expression(m.T, rule=lambda mm, t: mm.cf_profit[t])
             m.npv = pyo.Expression(expr=sum(discount_factors[t] * m.op_cash[t] for t in times))
             m.obj = pyo.Objective(expr=m.npv, sense=pyo.maximize)
 
@@ -1815,11 +1823,7 @@ def build_and_solve(
     )
     # [O3] Hourly operating cash flow is exactly the fixed-capacity objective term (tariffs and
     # co-location included); it is discounted by the age year's factor, net of variable O&M.
-    m.op_cash = pyo.Expression(
-        m.T,
-        rule=lambda mm, t: standalone_term(mm, t)
-        + (colocation_addendum_term(mm, t) if generation_mwh is not None else 0.0),
-    )
+    m.op_cash = pyo.Expression(m.T, rule=lambda mm, t: mm.cf_profit[t])
     n_periods = len(setup.periods.hours)
     npv = sum(
         setup.df_step[t] * (m.op_cash[t] - setup.var_om_per_mwh * m.dsch_mwh[t]) for t in times
@@ -1866,6 +1870,28 @@ def build_and_solve(
     return m, results, metrics
 
 
+CASHFLOW_COMPONENTS = {
+    "spot_revenue_eur": "cf_spot_revenue",
+    "spot_cost_eur": "cf_spot_cost",
+    "charge_tariff_eur": "cf_charge_tariff",
+    "discharge_tariff_eur": "cf_discharge_tariff",
+    "profit_eur": "cf_profit",
+}
+
+
+def hourly_cashflows(model: pyo.ConcreteModel) -> dict[str, list[float]]:
+    """Per-timestep cash flows (EUR, undiscounted) of a solved model, read from the same
+    Expressions the objective is built from (see O1-O2) — callers store and sum these instead
+    of re-deriving money from the dispatch. Costs and tariffs are positive numbers;
+    profit_eur = spot_revenue_eur − spot_cost_eur − charge_tariff_eur − discharge_tariff_eur,
+    and in the fixed-capacity, undiscounted model Σ profit_eur equals the objective."""
+    # + 0.0 turns an idle hour's −0.0 into 0.0, so written values match the original output.
+    return {
+        name: [pyo.value(getattr(model, component)[t]) + 0.0 for t in model.T]
+        for name, component in CASHFLOW_COMPONENTS.items()
+    }
+
+
 def write_output(
     path: Path,
     prices: PriceSeries,
@@ -1883,6 +1909,8 @@ def write_output(
 ) -> None:
     """extra_columns: additional per-timestep columns (e.g. degradation period, capacity)."""
     eta_leg = math.sqrt(round_trip_efficiency)
+    # Money comes from the objective's own per-timestep Expressions, not re-derived here.
+    cashflows = hourly_cashflows(model)
     rows = []
     cumulative_revenue = 0.0
     for t in range(len(prices)):
@@ -1895,37 +1923,19 @@ def write_output(
         p_buy = prices.buy[t]
         p_sell = prices.sell[t]
         p_curt = prices.curt[t]
-        p_refund = prices.refund[t]
-        # Effective charge tariff for this timestep: per-timestep series takes precedence.
-        eff_charge_tariff = consumption_tariffs[t] if consumption_tariffs is not None else charge_tariff
 
         if generation_mwh is not None:
             # Taxable share of charging: grid-imported portion (above available BTM generation).
             ch_grid_taxable = pyo.value(model.ch_grid_mwh[t])
             ch_btm = ch_total - ch_grid_taxable          # behind-the-meter share (untaxed)
-            ch_from_gen_avail_t = pyo.value(model.ch_from_gen_avail[t])
             ch_from_gen_curt_t = pyo.value(model.ch_from_gen_curt[t])
             ch_from_gen_surplus_t = pyo.value(model.ch_from_gen_surplus[t])
-            revenue = (
-                p_sell * dsch_grid
-                - p_buy * ch_total
-                + p_refund * (ch_from_gen_curt_t + ch_from_gen_surplus_t)
-                - discharge_tariff * dsch_grid
-                + discharge_tariff * ch_from_gen_avail_t
-                - eff_charge_tariff * ch_grid_taxable
-            )
         else:
             # Stand-alone: ch_mwh is purely grid import.
             ch_grid_taxable = ch_total
             ch_btm = 0.0
-            ch_from_gen_avail_t = 0.0
-            revenue = (
-                p_sell * dsch_grid
-                - p_buy * ch_total
-                - discharge_tariff * dsch_grid
-                - eff_charge_tariff * ch_total
-            )
 
+        revenue = cashflows["profit_eur"][t]
         cumulative_revenue += revenue
 
         # Co-location columns — computed for all rows; zero-filled when feature is disabled.
@@ -1974,6 +1984,7 @@ def write_output(
             "objective": revenue,
             "revenue": revenue,
             "cumulative_revenue": cumulative_revenue,
+            **{name: values[t] for name, values in cashflows.items()},
             "generation_mw": row_generation_mw,
             "charge_btm_mwh": row_charge_btm_mwh,
             "charge_grid_mwh": row_charge_grid_mwh,

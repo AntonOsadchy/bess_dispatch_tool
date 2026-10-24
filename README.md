@@ -391,27 +391,35 @@ over "free" `gen_curt`/`gen_surplus` charging and uses more than the floor requi
 
 ### Objective addendum
 
-**O2 — Co-location**: `standalone_term` (O1) applies unconditionally; `colocation_addendum_term`
-is added only in co-location mode (see `profit_rule` in `src/bess_dispatch_opt.py`):
+**O2 — Co-location**: in both modes the objective is the sum of one per-timestep cash flow,
+`cf_profit[t]`, split into four components (Pyomo Expressions on the model, see
+`src/bess_dispatch_opt.py`). Each component carries the stand-alone (O1) term on all of `ch_mwh[t]` /
+`dsch_mwh[t]`; in co-location mode it then subtracts the BTM-sourced share it should not carry:
 
 ```
-standalone_term[t]          =  price_sell[t]    × dsch_mwh[t] − price_buy[t] × ch_mwh[t]
-                              − discharge_tariff × dsch_mwh[t]
-                              − charge_tariff    × ch_mwh[t]
+cf_spot_revenue[t]     = price_sell[t] × dsch_mwh[t]
+cf_spot_cost[t]        = price_buy[t]  × ch_mwh[t]
+                         − price_refund[t] × (ch_from_gen_curt[t] + ch_from_gen_surplus[t])   (co-location)
+cf_charge_tariff[t]    = charge_tariff × ch_mwh[t]
+                         − charge_tariff × ch_btm[t]                                          (co-location)
+cf_discharge_tariff[t] = discharge_tariff × dsch_mwh[t]
+                         − discharge_tariff × ch_from_gen_avail[t]                             (co-location)
 
-colocation_addendum_term[t] =  charge_tariff    × ch_btm[t]
-                              + price_refund[t]  × (ch_from_gen_curt[t] + ch_from_gen_surplus[t])
-                              + discharge_tariff × ch_from_gen_avail[t]
+cf_profit[t] = cf_spot_revenue[t] − cf_spot_cost[t] − cf_charge_tariff[t] − cf_discharge_tariff[t]
 
-max  Σ_t [ standalone_term[t] + colocation_addendum_term[t] ]   (co-location mode)
-max  Σ_t   standalone_term[t]                                    (stand-alone mode)
+max  Σ_t cf_profit[t]
 ```
 
-`standalone_term` prices and taxes all of `ch_mwh[t]` as if it were grid-imported;
-`colocation_addendum_term` refunds exactly the three BTM treatments already established above —
-`charge_tariff` on the full `ch_btm[t]`, the reference price on the `gen_curt`/`gen_surplus` share, and
-`discharge_tariff` on the `gen_avail` share — with `ch_btm[t] = ch_from_gen_avail[t] +
-ch_from_gen_curt[t] + ch_from_gen_surplus[t]`.
+So in co-location mode only the grid-imported share is taxed (`charge_tariff` on the full
+`ch_btm[t]` is taken back), generation that would have been wasted (`gen_curt`/`gen_surplus`) has no
+spot cost, and `discharge_tariff` is refunded on the `gen_avail` share — with `ch_btm[t] =
+ch_from_gen_avail[t] + ch_from_gen_curt[t] + ch_from_gen_surplus[t]`.
+
+`hourly_cashflows(model)` returns these components per timestep (`spot_revenue_eur`,
+`spot_cost_eur`, `charge_tariff_eur`, `discharge_tariff_eur`, `profit_eur`) and the output CSV
+carries them as columns, so anything reporting money uses the optimiser's own terms rather than
+re-deriving them from the dispatch. In the fixed-capacity, undiscounted model `Σ_t profit_eur` equals
+the objective.
 
 `charge_tariff` is replaced by `ctariff[t]` when a per-timestep consumption tariff series is supplied.
 
@@ -580,7 +588,7 @@ max  Σ_t DF[y(t)] · ( op_cash[t] − var_om · dsch_mwh[t] )
      + DF_end · terminal_value · Cap[P+1]
 ```
 
-`op_cash[t]` is exactly the fixed-capacity hourly term (O1, plus O2 in co-location mode), so tariffs
+`op_cash[t]` is exactly the fixed-capacity hourly term `cf_profit[t]`, so tariffs
 and co-location are included. In code the LP minimises −NPV: with crossover off, this HiGHS version
 reports status "Unknown" and returns duals with the wrong sign for maximisation problems, but handles
 minimisation correctly.

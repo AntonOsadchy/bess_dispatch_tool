@@ -333,7 +333,12 @@ def test_1_degradation_off_matches_main_branch_colocation(tmp_path):
         spec = write_spec(tmp_path / f"{name}.txt", {**keys, "output_csv": f"out_{name}.csv"})
         res = run_tool(spec, tool) if tool else run_tool(spec)
         assert res.returncode == 0, res.stderr + res.stdout
-    assert (tmp_path / "out_old.csv").read_bytes() == (tmp_path / "out_new.csv").read_bytes()
+    # Every column main writes is unchanged as text; the per-timestep cash-flow columns
+    # (bdo.CASHFLOW_COMPONENTS) may be new relative to main.
+    old = pd.read_csv(tmp_path / "out_old.csv", dtype=str)
+    new = pd.read_csv(tmp_path / "out_new.csv", dtype=str)
+    assert set(new.columns) - set(old.columns) <= set(bdo.CASHFLOW_COMPONENTS)
+    pd.testing.assert_frame_equal(old, new[old.columns])
     assert (tmp_path / "out_old.txt").read_bytes() == (tmp_path / "out_new.txt").read_bytes()
 
 
