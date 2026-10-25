@@ -388,6 +388,14 @@ def average_daily_price_spread(
     return float(daily.mean()) if not daily.empty else float("nan")
 
 
+def generation_capacity_factor(generation_mwh: list[float], capacity_mw: float,
+                               interval_hours: float = INTERVAL_HOURS) -> float:
+    """Capacity factor of a co-located generator over the series: generation /
+    (nameplate MW x hours). The generation_capacity_factor standard output metric
+    (see build_and_solve) and the report's own figure."""
+    return sum(generation_mwh) / (capacity_mw * len(generation_mwh) * interval_hours)
+
+
 def scale_generation_profile(values: list[float], max_mw: float | None = None) -> list[float]:
     """Turn a loaded generation profile into MWh per interval.
 
@@ -1506,6 +1514,10 @@ def build_and_solve(
     # caller's own day_index instead.
     prices_start_date: str | pd.Timestamp | None = None,
     prices_timezone: str = "Europe/Copenhagen",
+    # Co-location mode only: nameplate capacity (MW) of the generator behind generation_mwh.
+    # Only used for the generation_capacity_factor standard output metric below - the model
+    # itself only ever needs generation_mwh.
+    generation_capacity_mw: float | None = None,
     # Endogenous degradation (None = fixed capacity, the original model). When set, the model is
     # a pure LP solved with HiGHS and C6 must be off.
     degradation: DegradationSetup | None = None,
@@ -1793,6 +1805,14 @@ def build_and_solve(
             prices.sell, prices.buy, start_date=prices_start_date, timezone=prices_timezone
         ),
     }
+    # Co-location mode with the generator's nameplate given: its capacity factor over the
+    # solved timesteps.
+    if generation_mwh is not None and generation_capacity_mw is not None:
+        if generation_capacity_mw <= 0:
+            sys.exit("generation_capacity_mw must be positive")
+        metrics["generation_capacity_factor"] = generation_capacity_factor(
+            generation_mwh, generation_capacity_mw
+        )
 
     if degradation is None:
         if discount_factors is None:
@@ -2235,6 +2255,7 @@ def main() -> None:
             else None,
             no_simultaneous_charge_discharge=no_simultaneous,
             generation_mwh=cut(generation_mwh),
+            generation_capacity_mw=gen_max_mw,
             grid_import_mw=grid_import_mw,
             grid_export_mw=grid_export_mw,
             consumption_tariffs=cut(consumption_tariffs),
@@ -2593,7 +2614,7 @@ def main() -> None:
         gen_hours = sum(1 for g in generation_mwh if g > 0)
         report_lines.append(f"  Generation profile CSV               : {gen_profile_csv}")
         if gen_max_mw is not None:
-            capacity_factor = gen_total / (gen_max_mw * len(generation_mwh))
+            capacity_factor = generation_capacity_factor(generation_mwh, gen_max_mw)
             report_lines.append(f"  Generation nameplate capacity        : {gen_max_mw:>10.2f} MW")
             report_lines.append(f"  Capacity factor                      : {capacity_factor*100:>10.1f} %")
         else:

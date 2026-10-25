@@ -282,6 +282,11 @@ Available generation per timestep:
 generation_mwh[t] = capacity_factor[t] × generation_max_mw × interval_hours
 ```
 
+The generator's capacity factor over the run, `Σ_t generation_mwh[t] / (generation_max_mw ×
+T × interval_hours)`, is a standard output: `build_and_solve(..., generation_capacity_mw=...)`
+returns it as `metrics["generation_capacity_factor"]` (over the solved timesteps) when given the
+nameplate, and the report prints it.
+
 Everything in [Stand-alone model](#stand-alone-model) still applies; this section lists what is
 added or changed on top of it.
 

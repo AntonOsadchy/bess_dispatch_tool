@@ -122,3 +122,17 @@ def test_output_csv_carries_the_cashflows(tmp_path):
         assert df[name].tolist() == pytest.approx(cf[name], abs=1e-9)
     assert df["revenue"].tolist() == pytest.approx(df["profit_eur"].tolist(), abs=1e-9)
     assert df["cumulative_revenue"].iloc[-1] == pytest.approx(pyo.value(m.obj), rel=1e-12)
+
+
+def test_colocated_metrics_carry_the_generation_capacity_factor():
+    """Co-location mode with the nameplate given: generation / (nameplate MW x hours) as a
+    standard output; absent without the nameplate, and in stand-alone mode."""
+    prices = bdo.resolve_prices(None, None, _prices())
+    solar = _solar(2.0)
+    colocated = dict(CASES["co-located, clipping + curtailment"])
+    _, _, metrics = bdo.build_and_solve(prices, **BATTERY, **colocated, generation_capacity_mw=2.0)
+    assert metrics["generation_capacity_factor"] == pytest.approx(sum(solar) / (2.0 * HOURS))
+    _, _, without_nameplate = bdo.build_and_solve(prices, **BATTERY, **colocated)
+    assert "generation_capacity_factor" not in without_nameplate
+    _, _, standalone = bdo.build_and_solve(prices, **BATTERY, **CASES["stand-alone"], generation_capacity_mw=2.0)
+    assert "generation_capacity_factor" not in standalone
